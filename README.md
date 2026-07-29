@@ -55,9 +55,8 @@ costsee init
 opencode_monthly_usd = 20.0
 ```
 
-標準の設定場所は macOS では
-`~/Library/Application Support/costsee/config.toml`、Linux では
-`~/.config/costsee/config.toml` です。`--config` で別の場所も指定できます。
+標準の設定場所はOSによらず `~/.config/costsee/config.toml` です。
+`--config` で別の場所も指定できます。
 
 ## 非対話レポート
 

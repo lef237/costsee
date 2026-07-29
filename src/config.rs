@@ -40,9 +40,12 @@ impl Default for Paths {
 
 impl Config {
     pub fn path() -> PathBuf {
-        dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("costsee/config.toml")
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        Self::path_from_home(&home)
+    }
+
+    fn path_from_home(home: &std::path::Path) -> PathBuf {
+        home.join(".config/costsee/config.toml")
     }
 
     pub fn load(path: Option<PathBuf>) -> Result<(Self, PathBuf)> {
@@ -74,5 +77,19 @@ impl Config {
         );
         fs::write(&path, raw)?;
         Ok(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn default_config_is_under_dot_config_on_every_platform() {
+        assert_eq!(
+            Config::path_from_home(Path::new("/home/alice")),
+            PathBuf::from("/home/alice/.config/costsee/config.toml")
+        );
     }
 }
