@@ -78,6 +78,11 @@ pub fn codex_quota(root: &Path) -> Result<QuotaSummary> {
             .lines()
             .map_while(Result::ok)
         {
+            // Session logs can contain conversation records. Only deserialize lines
+            // that can be rate-limit events, and never retain the other records.
+            if !line.contains("\"event_msg\"") || !line.contains("\"token_count\"") {
+                continue;
+            }
             let Ok(value) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
@@ -290,15 +295,13 @@ pub fn capture_claude(input: &str, cache: &Path) -> Result<Vec<LimitWindow>> {
         .ok()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
     let now = Local::now().timestamp();
-    let merged_limits = merge_claude_limits(existing.as_ref(), &incoming, now);
+    let rate_limits = merge_claude_limits(existing.as_ref(), &incoming, now).unwrap_or_default();
+    let sanitized = serde_json::json!({ "rate_limits": rate_limits });
 
-    if let Some(rate_limits) = merged_limits {
-        let existing_limits = existing.as_ref().and_then(|value| value.get("rate_limits"));
-        if existing_limits != Some(&Value::Object(rate_limits.clone())) {
-            let mut value = incoming;
-            value["rate_limits"] = Value::Object(rate_limits);
-            write_json_atomically(cache, &value)?;
-        }
+    // Persist only the allowance fields. This also strips session metadata from
+    // caches written by older costsee versions.
+    if existing.as_ref() != Some(&sanitized) {
+        write_json_atomically(cache, &sanitized)?;
     }
 
     FileExt::unlock(&lock)?;
@@ -393,6 +396,12 @@ mod tests {
         let windows = capture_claude(&input.to_string(), &cache).unwrap();
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[1].used_percent, 41.2);
+        let cached: Value =
+            serde_json::from_str(&std::fs::read_to_string(&cache).unwrap()).unwrap();
+        assert_eq!(
+            cached.as_object().unwrap().keys().collect::<Vec<_>>(),
+            vec!["rate_limits"]
+        );
     }
 
     #[test]
@@ -423,6 +432,33 @@ mod tests {
         let windows = capture_claude(&stale.to_string(), &cache).unwrap();
         assert_eq!(windows[0].used_percent, 8.0);
         assert_eq!(windows[1].used_percent, 6.0);
+    }
+
+    #[test]
+    fn claude_capture_strips_legacy_session_metadata() {
+        let directory = tempdir().unwrap();
+        let cache = directory.path().join("claude.json");
+        let now = Local::now().timestamp();
+        let legacy = serde_json::json!({
+            "cwd": "/private/project",
+            "session_id": "secret-session-id",
+            "transcript_path": "/private/transcript.jsonl",
+            "cost": {"total_cost_usd": 12.34},
+            "rate_limits": {
+                "five_hour": {"used_percentage": 8.0, "resets_at": now + 3_600}
+            }
+        });
+        std::fs::write(&cache, legacy.to_string()).unwrap();
+
+        capture_claude(r#"{"session_id":"another-session"}"#, &cache).unwrap();
+
+        let cached: Value =
+            serde_json::from_str(&std::fs::read_to_string(&cache).unwrap()).unwrap();
+        assert!(cached.get("cwd").is_none());
+        assert!(cached.get("session_id").is_none());
+        assert!(cached.get("transcript_path").is_none());
+        assert!(cached.get("cost").is_none());
+        assert_eq!(cached["rate_limits"]["five_hour"]["used_percentage"], 8.0);
     }
 
     #[test]
