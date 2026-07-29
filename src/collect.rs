@@ -4,13 +4,15 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Local, TimeZone};
+use fs2::FileExt;
 use rusqlite::Connection;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::{
-    fs::File,
-    io::{BufRead, BufReader},
+    fs::{File, OpenOptions},
+    io::{BufRead, BufReader, Write},
     path::Path,
 };
+use tempfile::NamedTempFile;
 use walkdir::WalkDir;
 
 pub fn collect_quotas(config: &Config) -> QuotaSnapshot {
@@ -130,21 +132,28 @@ pub fn claude_quota(cache: &Path) -> Result<QuotaSummary> {
     let raw = std::fs::read_to_string(cache)?;
     let value: Value = serde_json::from_str(&raw)?;
     let mut windows = Vec::new();
+    let now = Local::now().timestamp();
     for (key, label) in [("five_hour", "5 hours"), ("seven_day", "7 days")] {
         let rate_limit = &value["rate_limits"][key];
-        let Some(percent) = rate_limit["used_percentage"].as_f64() else {
+        let Some((percent, resets_at)) = valid_claude_window(rate_limit, now) else {
             continue;
         };
         windows.push(LimitWindow {
             label: label.into(),
             used_percent: percent,
-            resets_at: rate_limit["resets_at"]
-                .as_i64()
-                .and_then(|seconds| Local.timestamp_opt(seconds, 0).single()),
+            resets_at: Local.timestamp_opt(resets_at, 0).single(),
             detail: "reported by Claude Code".into(),
         });
     }
     if windows.is_empty() {
+        if value["rate_limits"]
+            .as_object()
+            .is_some_and(|limits| !limits.is_empty())
+        {
+            anyhow::bail!(
+                "Claude Code allowance data is expired; waiting for a current API response"
+            );
+        }
         anyhow::bail!("Claude Code has not reported subscription limits yet");
     }
     Ok(QuotaSummary {
@@ -263,14 +272,93 @@ fn opencode_window(
 }
 
 pub fn capture_claude(input: &str, cache: &Path) -> Result<Vec<LimitWindow>> {
-    let value: Value = serde_json::from_str(input).context("invalid Claude status-line JSON")?;
+    let incoming: Value = serde_json::from_str(input).context("invalid Claude status-line JSON")?;
     if let Some(parent) = cache.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let temporary = cache.with_extension("tmp");
-    std::fs::write(&temporary, serde_json::to_vec(&value)?)?;
-    std::fs::rename(temporary, cache)?;
+
+    let lock_path = cache.with_extension("lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    lock.lock_exclusive()?;
+
+    let existing = std::fs::read_to_string(cache)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+    let now = Local::now().timestamp();
+    let merged_limits = merge_claude_limits(existing.as_ref(), &incoming, now);
+
+    if let Some(rate_limits) = merged_limits {
+        let existing_limits = existing.as_ref().and_then(|value| value.get("rate_limits"));
+        if existing_limits != Some(&Value::Object(rate_limits.clone())) {
+            let mut value = incoming;
+            value["rate_limits"] = Value::Object(rate_limits);
+            write_json_atomically(cache, &value)?;
+        }
+    }
+
+    FileExt::unlock(&lock)?;
     Ok(claude_quota(cache)?.windows)
+}
+
+fn valid_claude_window(value: &Value, now: i64) -> Option<(f64, i64)> {
+    let percent = value["used_percentage"].as_f64()?;
+    let resets_at = value["resets_at"].as_i64()?;
+    (percent.is_finite() && (0.0..=100.0).contains(&percent) && resets_at > now)
+        .then_some((percent, resets_at))
+}
+
+fn merge_claude_limits(
+    existing: Option<&Value>,
+    incoming: &Value,
+    now: i64,
+) -> Option<Map<String, Value>> {
+    let mut merged = Map::new();
+    for key in ["five_hour", "seven_day"] {
+        let old = existing
+            .and_then(|value| value.get("rate_limits"))
+            .and_then(|limits| limits.get(key));
+        let new = incoming
+            .get("rate_limits")
+            .and_then(|limits| limits.get(key));
+        let selected = match (
+            old.and_then(|value| valid_claude_window(value, now)),
+            new.and_then(|value| valid_claude_window(value, now)),
+        ) {
+            (Some((old_percent, old_reset)), Some((new_percent, new_reset)))
+                if new_reset > old_reset
+                    || (new_reset == old_reset && new_percent >= old_percent) =>
+            {
+                new
+            }
+            (Some(_), _) => old,
+            (None, Some(_)) => new,
+            (None, None) => None,
+        };
+        if let Some(value) = selected {
+            merged.insert(key.into(), value.clone());
+        }
+    }
+    (!merged.is_empty()).then_some(merged)
+}
+
+fn write_json_atomically(cache: &Path, value: &Value) -> Result<()> {
+    let parent = cache
+        .parent()
+        .context("Claude usage cache has no parent directory")?;
+    let mut temporary = NamedTempFile::new_in(parent)?;
+    serde_json::to_writer(&mut temporary, value)?;
+    temporary.flush()?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(cache)
+        .map_err(|error| error.error)
+        .with_context(|| format!("failed to replace {}", cache.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -295,10 +383,119 @@ mod tests {
     fn captures_claude_status_line_data() {
         let directory = tempdir().unwrap();
         let cache = directory.path().join("claude.json");
-        let input = r#"{"rate_limits":{"five_hour":{"used_percentage":23.5,"resets_at":1782867600},"seven_day":{"used_percentage":41.2,"resets_at":1783126800}}}"#;
-        let windows = capture_claude(input, &cache).unwrap();
+        let now = Local::now().timestamp();
+        let input = serde_json::json!({
+            "rate_limits": {
+                "five_hour": {"used_percentage": 23.5, "resets_at": now + 3_600},
+                "seven_day": {"used_percentage": 41.2, "resets_at": now + 86_400}
+            }
+        });
+        let windows = capture_claude(&input.to_string(), &cache).unwrap();
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[1].used_percent, 41.2);
+    }
+
+    #[test]
+    fn claude_cache_ignores_missing_and_older_session_limits() {
+        let directory = tempdir().unwrap();
+        let cache = directory.path().join("claude.json");
+        let now = Local::now().timestamp();
+        let current = serde_json::json!({
+            "session_id": "current",
+            "rate_limits": {
+                "five_hour": {"used_percentage": 8.0, "resets_at": now + 3_600},
+                "seven_day": {"used_percentage": 6.0, "resets_at": now + 86_400}
+            }
+        });
+        capture_claude(&current.to_string(), &cache).unwrap();
+
+        let without_limits = serde_json::json!({"session_id": "new-session"});
+        let windows = capture_claude(&without_limits.to_string(), &cache).unwrap();
+        assert_eq!(windows[0].used_percent, 8.0);
+
+        let stale = serde_json::json!({
+            "session_id": "old-session",
+            "rate_limits": {
+                "five_hour": {"used_percentage": 33.0, "resets_at": now + 1_800},
+                "seven_day": {"used_percentage": 13.0, "resets_at": now + 43_200}
+            }
+        });
+        let windows = capture_claude(&stale.to_string(), &cache).unwrap();
+        assert_eq!(windows[0].used_percent, 8.0);
+        assert_eq!(windows[1].used_percent, 6.0);
+    }
+
+    #[test]
+    fn claude_cache_accepts_a_new_reset_with_lower_usage() {
+        let directory = tempdir().unwrap();
+        let cache = directory.path().join("claude.json");
+        let now = Local::now().timestamp();
+        let first = serde_json::json!({
+            "rate_limits": {
+                "five_hour": {"used_percentage": 90.0, "resets_at": now + 60}
+            }
+        });
+        capture_claude(&first.to_string(), &cache).unwrap();
+        let reset = serde_json::json!({
+            "rate_limits": {
+                "five_hour": {"used_percentage": 2.0, "resets_at": now + 18_000}
+            }
+        });
+        let windows = capture_claude(&reset.to_string(), &cache).unwrap();
+        assert_eq!(windows[0].used_percent, 2.0);
+    }
+
+    #[test]
+    fn concurrent_claude_captures_keep_the_newest_window() {
+        let directory = tempdir().unwrap();
+        let cache = directory.path().join("claude.json");
+        let now = Local::now().timestamp();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut threads = Vec::new();
+
+        for (percent, reset_offset) in [(80.0, 3_600), (4.0, 18_000)] {
+            let cache = cache.clone();
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                let input = serde_json::json!({
+                    "rate_limits": {
+                        "five_hour": {
+                            "used_percentage": percent,
+                            "resets_at": now + reset_offset
+                        }
+                    }
+                });
+                barrier.wait();
+                capture_claude(&input.to_string(), &cache).unwrap();
+            }));
+        }
+        barrier.wait();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let summary = claude_quota(&cache).unwrap();
+        assert_eq!(summary.windows[0].used_percent, 4.0);
+        assert_eq!(
+            summary.windows[0].resets_at.unwrap().timestamp(),
+            now + 18_000
+        );
+    }
+
+    #[test]
+    fn claude_quota_rejects_expired_limits() {
+        let directory = tempdir().unwrap();
+        let cache = directory.path().join("claude.json");
+        let expired = serde_json::json!({
+            "rate_limits": {
+                "five_hour": {
+                    "used_percentage": 99.0,
+                    "resets_at": Local::now().timestamp() - 1
+                }
+            }
+        });
+        std::fs::write(&cache, expired.to_string()).unwrap();
+        assert!(claude_quota(&cache).is_err());
     }
 
     #[test]

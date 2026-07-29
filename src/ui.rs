@@ -39,9 +39,15 @@ fn app_loop(
     config_path: std::path::PathBuf,
 ) -> Result<()> {
     let mut snapshot = collect_quotas(&config);
+    let mut claude_cache_modified = cache_modified(&config.paths.claude_usage_cache);
     loop {
         terminal.draw(|frame| draw(frame, &snapshot, &config_path))?;
         if !event::poll(Duration::from_millis(500))? {
+            let modified = cache_modified(&config.paths.claude_usage_cache);
+            if modified != claude_cache_modified {
+                snapshot = collect_quotas(&config);
+                claude_cache_modified = modified;
+            }
             continue;
         }
         if let Event::Key(key) = event::read()? {
@@ -50,12 +56,21 @@ fn app_loop(
             }
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => break,
-                KeyCode::Char('r') => snapshot = collect_quotas(&config),
+                KeyCode::Char('r') => {
+                    snapshot = collect_quotas(&config);
+                    claude_cache_modified = cache_modified(&config.paths.claude_usage_cache);
+                }
                 _ => {}
             }
         }
     }
     Ok(())
+}
+
+fn cache_modified(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
 }
 
 fn draw(frame: &mut ratatui::Frame, snapshot: &QuotaSnapshot, config_path: &std::path::Path) {

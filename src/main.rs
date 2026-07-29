@@ -107,7 +107,16 @@ fn setup_claude() -> Result<()> {
     );
     if let Some(existing) = value.get("statusLine") {
         if existing["command"].as_str() == Some(&command) {
-            println!("Claude Code is already connected.");
+            if value["statusLine"].get("refreshInterval").is_some() {
+                value["statusLine"]
+                    .as_object_mut()
+                    .expect("statusLine was checked as an object")
+                    .remove("refreshInterval");
+                write_claude_settings(&settings, &value)?;
+                println!("Updated Claude Code connection via {}", settings.display());
+            } else {
+                println!("Claude Code is already connected.");
+            }
             return Ok(());
         }
         anyhow::bail!(
@@ -117,17 +126,21 @@ fn setup_claude() -> Result<()> {
     }
     value["statusLine"] = serde_json::json!({
         "type": "command",
-        "command": command,
-        "refreshInterval": 60
+        "command": command
     });
+    write_claude_settings(&settings, &value)?;
+    println!("Connected Claude Code via {}", settings.display());
+    println!("Send one Claude Code message, then press r in costsee.");
+    Ok(())
+}
+
+fn write_claude_settings(settings: &std::path::Path, value: &serde_json::Value) -> Result<()> {
     if let Some(parent) = settings.parent() {
         fs::create_dir_all(parent)?;
     }
     let temporary = settings.with_extension("json.tmp");
     fs::write(&temporary, serde_json::to_vec_pretty(&value)?)?;
-    fs::rename(temporary, &settings)?;
-    println!("Connected Claude Code via {}", settings.display());
-    println!("Send one Claude Code message, then press r in costsee.");
+    fs::rename(temporary, settings)?;
     Ok(())
 }
 
