@@ -8,18 +8,20 @@ use fs2::FileExt;
 use rusqlite::Connection;
 use serde_json::{Map, Value};
 use std::{
-    fs::{File, OpenOptions},
+    fs::OpenOptions,
     io::{BufRead, BufReader, Write},
     path::Path,
+    process::{Child, Command, Stdio},
+    sync::mpsc,
+    time::Duration,
 };
 use tempfile::NamedTempFile;
-use walkdir::WalkDir;
 
 pub fn collect_quotas(config: &Config) -> QuotaSnapshot {
     let mut snapshot = QuotaSnapshot::default();
     snapshot.tools.insert(
         Tool::Codex,
-        codex_quota(&config.paths.codex).unwrap_or_else(error_summary),
+        codex_quota(&config.commands.codex).unwrap_or_else(error_summary),
     );
     snapshot.tools.insert(
         Tool::Claude,
@@ -39,28 +41,6 @@ fn error_summary(err: anyhow::Error) -> QuotaSummary {
     }
 }
 
-fn jsonl_files(root: &Path) -> Result<Vec<std::path::PathBuf>> {
-    if !root.exists() {
-        anyhow::bail!("not found: {}", root.display());
-    }
-    Ok(WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            entry.file_type().is_file()
-                && entry.path().extension().is_some_and(|ext| ext == "jsonl")
-        })
-        .map(|entry| entry.into_path())
-        .collect())
-}
-
-fn parse_time(value: &Value) -> Option<DateTime<Local>> {
-    DateTime::parse_from_rfc3339(value.as_str()?)
-        .ok()
-        .map(|at| at.with_timezone(&Local))
-}
-
 fn window_label(minutes: u64) -> String {
     match minutes {
         300 => "5 hours".into(),
@@ -71,52 +51,117 @@ fn window_label(minutes: u64) -> String {
     }
 }
 
-pub fn codex_quota(root: &Path) -> Result<QuotaSummary> {
-    let mut latest: Option<(DateTime<Local>, Value)> = None;
-    for path in jsonl_files(root)? {
-        for line in BufReader::new(File::open(path)?)
-            .lines()
-            .map_while(Result::ok)
-        {
-            // Session logs can contain conversation records. Only deserialize lines
-            // that can be rate-limit events, and never retain the other records.
-            if !line.contains("\"event_msg\"") || !line.contains("\"token_count\"") {
-                continue;
-            }
-            let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            if value["type"] != "event_msg"
-                || value["payload"]["type"] != "token_count"
-                || value["payload"]["rate_limits"].is_null()
-            {
-                continue;
-            }
-            let Some(at) = parse_time(&value["timestamp"]) else {
-                continue;
-            };
-            if latest.as_ref().is_none_or(|(current, _)| at > *current) {
-                latest = Some((at, value["payload"]["rate_limits"].clone()));
+pub fn codex_quota(executable: &Path) -> Result<QuotaSummary> {
+    let response = codex_rate_limits(executable)?;
+    codex_summary(&response, Local::now())
+}
+
+fn codex_rate_limits(executable: &Path) -> Result<Value> {
+    let mut child = ChildGuard(
+        Command::new(executable)
+            .args(["app-server", "--listen", "stdio://"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("failed to start {}", executable.display()))?,
+    );
+    let stdout = child
+        .0
+        .stdout
+        .take()
+        .context("Codex stdout is unavailable")?;
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                let _ = sender.send(value);
             }
         }
+    });
+    let stdin = child
+        .0
+        .stdin
+        .as_mut()
+        .context("Codex stdin is unavailable")?;
+    let initialize = serde_json::json!({
+        "method": "initialize",
+        "id": 0,
+        "params": {
+            "clientInfo": {
+                "name": "costsee",
+                "title": "costsee",
+                "version": env!("CARGO_PKG_VERSION")
+            }
+        }
+    });
+    send_json_line(stdin, &initialize)?;
+    receive_rpc_result(&receiver, 0)?;
+    for request in [
+        serde_json::json!({"method": "initialized", "params": {}}),
+        serde_json::json!({"method": "account/rateLimits/read", "id": 1}),
+    ] {
+        send_json_line(stdin, &request)?;
     }
-    let Some((updated_at, limits)) = latest else {
-        anyhow::bail!("rate-limit data has not been recorded yet");
-    };
+    receive_rpc_result(&receiver, 1)
+}
+
+fn send_json_line(writer: &mut impl Write, value: &Value) -> Result<()> {
+    serde_json::to_writer(&mut *writer, value)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn receive_rpc_result(receiver: &mpsc::Receiver<Value>, id: i64) -> Result<Value> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let response = receiver
+            .recv_timeout(remaining)
+            .context("timed out waiting for Codex rate limits")?;
+        if response["id"] != id {
+            continue;
+        }
+        if !response["error"].is_null() {
+            anyhow::bail!("Codex App Server error: {}", response["error"]);
+        }
+        return response
+            .get("result")
+            .cloned()
+            .context("Codex returned no rate-limit result");
+    }
+}
+
+fn codex_summary(response: &Value, updated_at: DateTime<Local>) -> Result<QuotaSummary> {
+    let limits = response["rateLimitsByLimitId"]["codex"]
+        .as_object()
+        .map(|_| &response["rateLimitsByLimitId"]["codex"])
+        .unwrap_or(&response["rateLimits"]);
     let mut windows = Vec::new();
-    for key in ["primary", "secondary", "individual_limit"] {
+    for key in ["primary", "secondary"] {
         let value = &limits[key];
-        let Some(percent) = value["used_percent"].as_f64() else {
+        let Some(percent) = value["usedPercent"].as_f64() else {
             continue;
         };
-        let minutes = value["window_minutes"].as_u64().unwrap_or(0);
+        let minutes = value["windowDurationMins"].as_u64().unwrap_or(0);
         windows.push(LimitWindow {
             label: window_label(minutes),
             used_percent: percent,
-            resets_at: value["resets_at"]
+            resets_at: value["resetsAt"]
                 .as_i64()
                 .and_then(|seconds| Local.timestamp_opt(seconds, 0).single()),
-            detail: "reported by Codex".into(),
+            detail: "Codex App Server".into(),
+        });
+    }
+    if let Some(remaining) = limits["individualLimit"]["remainingPercent"].as_f64() {
+        windows.push(LimitWindow {
+            label: "spend control".into(),
+            used_percent: 100.0 - remaining,
+            resets_at: limits["individualLimit"]["resetsAt"]
+                .as_i64()
+                .and_then(|seconds| Local.timestamp_opt(seconds, 0).single()),
+            detail: "Codex App Server".into(),
         });
     }
     if windows.is_empty() {
@@ -124,7 +169,7 @@ pub fn codex_quota(root: &Path) -> Result<QuotaSummary> {
     }
     Ok(QuotaSummary {
         windows,
-        plan: limits["plan_type"].as_str().map(str::to_owned),
+        plan: limits["planType"].as_str().map(str::to_owned),
         note: None,
         updated_at: Some(updated_at),
     })
@@ -185,6 +230,8 @@ pub fn opencode_quota(config: &Config) -> Result<QuotaSummary> {
     let connection =
         Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("failed to open {}", database.display()))?;
+    validate_opencode_database(&connection)
+        .context("unsupported OpenCode database format; update costsee")?;
     let now = Local::now();
     let month_start = Local
         .with_ymd_and_hms(now.year(), now.month(), 1, 0, 0, 0)
@@ -246,6 +293,23 @@ pub fn opencode_quota(config: &Config) -> Result<QuotaSummary> {
     })
 }
 
+fn validate_opencode_database(connection: &Connection) -> Result<()> {
+    let (has_messages, has_recognized): (bool, bool) = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM message),
+                EXISTS(
+                    SELECT 1 FROM message
+                    WHERE json_type(data, '$.providerID') IS NOT NULL
+                      AND json_type(data, '$.cost') IS NOT NULL
+                )",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if has_messages && !has_recognized {
+        anyhow::bail!("message records have no recognized provider/cost fields");
+    }
+    Ok(())
+}
+
 fn validate_go_limits(limits: &crate::config::OpenCodeGoAllowances) -> Result<()> {
     if limits.five_hour_usd <= 0.0 || limits.weekly_usd <= 0.0 || limits.monthly_usd <= 0.0 {
         anyhow::bail!("all OpenCode Go allowances must be greater than zero");
@@ -274,6 +338,15 @@ fn opencode_window(
         resets_at,
         detail: format!("${spent:.2} of ${limit:.2} · local"),
     })
+}
+
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 pub fn capture_claude(input: &str, cache: &Path) -> Result<Vec<LimitWindow>> {
@@ -368,15 +441,23 @@ fn write_json_atomically(cache: &Path, value: &Value) -> Result<()> {
 mod tests {
     use super::*;
     use crate::config::OpenCodeGoAllowances;
-    use std::io::Write;
     use tempfile::tempdir;
 
     #[test]
-    fn reads_latest_codex_allowance() {
-        let directory = tempdir().unwrap();
-        let mut file = File::create(directory.path().join("session.jsonl")).unwrap();
-        writeln!(file, r#"{{"timestamp":"2026-07-01T00:00:00Z","type":"event_msg","payload":{{"type":"token_count","rate_limits":{{"plan_type":"plus","primary":{{"used_percent":42.0,"window_minutes":300,"resets_at":1782867600}}}}}}}}"#).unwrap();
-        let summary = codex_quota(directory.path()).unwrap();
+    fn parses_codex_app_server_allowance() {
+        let now = Local::now();
+        let response = serde_json::json!({
+            "rateLimits": {
+                "planType": "plus",
+                "primary": {
+                    "usedPercent": 42.0,
+                    "windowDurationMins": 300,
+                    "resetsAt": now.timestamp() + 3_600
+                }
+            },
+            "rateLimitsByLimitId": null
+        });
+        let summary = codex_summary(&response, now).unwrap();
         assert_eq!(summary.windows[0].label, "5 hours");
         assert_eq!(summary.windows[0].used_percent, 42.0);
         assert_eq!(summary.plan.as_deref(), Some("plus"));
@@ -569,5 +650,29 @@ mod tests {
         assert_eq!(summary.windows[0].used_percent, 50.0);
         assert_eq!(summary.windows[1].used_percent, 20.0);
         assert_eq!(summary.windows[2].used_percent, 10.0);
+    }
+
+    #[test]
+    fn rejects_unrecognized_opencode_message_format() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute(
+                "CREATE TABLE message (
+                    id TEXT PRIMARY KEY,
+                    time_created INTEGER NOT NULL,
+                    data TEXT NOT NULL
+                )",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO message VALUES
+                 ('unknown', 0, '{\"provider\":\"opencode-go\",\"amount\":6.0}')",
+                [],
+            )
+            .unwrap();
+
+        assert!(validate_opencode_database(&connection).is_err());
     }
 }

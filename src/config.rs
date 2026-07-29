@@ -6,6 +6,7 @@ use std::{fs, path::PathBuf};
 #[serde(default)]
 pub struct Config {
     pub allowances: Allowances,
+    pub commands: Commands,
     pub paths: Paths,
 }
 
@@ -37,8 +38,21 @@ impl Default for OpenCodeGoAllowances {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
-pub struct Paths {
+pub struct Commands {
     pub codex: PathBuf,
+}
+
+impl Default for Commands {
+    fn default() -> Self {
+        Self {
+            codex: PathBuf::from("codex"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Paths {
     pub opencode_db: PathBuf,
     pub claude_usage_cache: PathBuf,
 }
@@ -47,7 +61,6 @@ impl Default for Paths {
     fn default() -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         Self {
-            codex: home.join(".codex/sessions"),
             opencode_db: home.join(".local/share/opencode/opencode.db"),
             claude_usage_cache: dirs::data_local_dir()
                 .unwrap_or_else(|| home.join(".local/share"))
