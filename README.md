@@ -42,18 +42,25 @@ costsee setup
 既存のステータスラインは上書きしません。接続後、Claude Code で一度メッセージを
 送ると利用率が保存されます。
 
-OpenCode の月間上限を設定する場合:
+OpenCode Go の期間別上限を設定する場合:
 
 ```console
 costsee init
 ```
 
-生成された設定の `[allowances]` に追記します。
+生成された設定に追記します。以下は OpenCode Go の公式上限です。
 
 ```toml
-[allowances]
-opencode_monthly_usd = 20.0
+[allowances.opencode_go]
+five_hour_usd = 12.0
+weekly_usd = 30.0
+monthly_usd = 60.0
 ```
+
+OpenCode Go のローカル履歴だけを対象に、直近5時間、直近7日間、今月の記録済み
+コストから利用率を推定します。5時間・週間枠の正確なリセット時刻はローカル履歴から
+取得できないため、画面では `unknown` と表示します。既存の
+`allowances.opencode_monthly_usd` も月間表示用として引き続き利用できます。
 
 標準の設定場所はOSによらず `~/.config/costsee/config.toml` です。
 `--config` で別の場所も指定できます。

@@ -12,9 +12,27 @@ pub struct Config {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Allowances {
-    /// OpenCode has no provider-independent quota API. Set this to your
-    /// OpenCode Zen/workspace monthly USD limit to enable its percentage.
+    /// Legacy single-window configuration. Prefer `opencode_go`.
     pub opencode_monthly_usd: Option<f64>,
+    pub opencode_go: Option<OpenCodeGoAllowances>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct OpenCodeGoAllowances {
+    pub five_hour_usd: f64,
+    pub weekly_usd: f64,
+    pub monthly_usd: f64,
+}
+
+impl Default for OpenCodeGoAllowances {
+    fn default() -> Self {
+        Self {
+            five_hour_usd: 12.0,
+            weekly_usd: 30.0,
+            monthly_usd: 60.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -71,8 +89,11 @@ impl Config {
         let raw = toml::to_string_pretty(&Self::default())?.replacen(
             "[allowances]\n",
             "[allowances]\n\
-             # OpenCode Zen/workspace の月間上限を設定すると利用率を表示します。\n\
-             # opencode_monthly_usd = 20.0\n",
+             # OpenCode Goを使う場合は次のコメントを外してください。\n\
+             # [allowances.opencode_go]\n\
+             # five_hour_usd = 12.0\n\
+             # weekly_usd = 30.0\n\
+             # monthly_usd = 60.0\n",
             1,
         );
         fs::write(&path, raw)?;

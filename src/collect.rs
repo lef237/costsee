@@ -159,11 +159,10 @@ pub fn claude_quota(cache: &Path) -> Result<QuotaSummary> {
 }
 
 pub fn opencode_quota(config: &Config) -> Result<QuotaSummary> {
-    let Some(limit) = config.allowances.opencode_monthly_usd else {
-        anyhow::bail!("set `allowances.opencode_monthly_usd` in config");
-    };
-    if limit <= 0.0 {
-        anyhow::bail!("OpenCode monthly allowance must be greater than zero");
+    let go_limits = config.allowances.opencode_go.as_ref();
+    let legacy_monthly = config.allowances.opencode_monthly_usd;
+    if go_limits.is_none() && legacy_monthly.is_none() {
+        anyhow::bail!("set `allowances.opencode_go` in config");
     }
     let database = &config.paths.opencode_db;
     if !database.exists() {
@@ -173,31 +172,93 @@ pub fn opencode_quota(config: &Config) -> Result<QuotaSummary> {
         Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("failed to open {}", database.display()))?;
     let now = Local::now();
-    let start = Local
+    let month_start = Local
         .with_ymd_and_hms(now.year(), now.month(), 1, 0, 0, 0)
         .single()
         .context("invalid month start")?;
-    let spent: f64 = connection.query_row(
-        "SELECT COALESCE(SUM(CAST(json_extract(data, '$.cost') AS REAL)), 0)
-         FROM message WHERE time_created >= ?1",
-        [start.timestamp_millis()],
-        |row| row.get(0),
-    )?;
     let (year, month) = if now.month() == 12 {
         (now.year() + 1, 1)
     } else {
         (now.year(), now.month() + 1)
     };
+    let month_reset = Local.with_ymd_and_hms(year, month, 1, 0, 0, 0).single();
+    let mut windows = Vec::new();
+
+    if let Some(limits) = go_limits {
+        validate_go_limits(limits)?;
+        windows.push(opencode_window(
+            &connection,
+            "5 hours",
+            now - chrono::Duration::hours(5),
+            limits.five_hour_usd,
+            None,
+        )?);
+        windows.push(opencode_window(
+            &connection,
+            "7 days",
+            now - chrono::Duration::days(7),
+            limits.weekly_usd,
+            None,
+        )?);
+        windows.push(opencode_window(
+            &connection,
+            "This month",
+            month_start,
+            limits.monthly_usd,
+            month_reset,
+        )?);
+    } else if let Some(limit) = legacy_monthly {
+        if limit <= 0.0 {
+            anyhow::bail!("OpenCode monthly allowance must be greater than zero");
+        }
+        windows.push(opencode_window(
+            &connection,
+            "This month",
+            month_start,
+            limit,
+            month_reset,
+        )?);
+    }
+
     Ok(QuotaSummary {
-        windows: vec![LimitWindow {
-            label: "This month".into(),
-            used_percent: spent / limit * 100.0,
-            resets_at: Local.with_ymd_and_hms(year, month, 1, 0, 0, 0).single(),
-            detail: format!("${spent:.2} of ${limit:.2}"),
-        }],
-        plan: Some("configured limit".into()),
+        windows,
+        plan: Some(if go_limits.is_some() {
+            "Go · local estimate".into()
+        } else {
+            "configured limit".into()
+        }),
         note: None,
         updated_at: Some(now),
+    })
+}
+
+fn validate_go_limits(limits: &crate::config::OpenCodeGoAllowances) -> Result<()> {
+    if limits.five_hour_usd <= 0.0 || limits.weekly_usd <= 0.0 || limits.monthly_usd <= 0.0 {
+        anyhow::bail!("all OpenCode Go allowances must be greater than zero");
+    }
+    Ok(())
+}
+
+fn opencode_window(
+    connection: &Connection,
+    label: &str,
+    start: DateTime<Local>,
+    limit: f64,
+    resets_at: Option<DateTime<Local>>,
+) -> Result<LimitWindow> {
+    let spent: f64 = connection.query_row(
+        "SELECT COALESCE(SUM(CAST(json_extract(data, '$.cost') AS REAL)), 0)
+         FROM message
+         WHERE time_created >= ?1
+           AND json_extract(data, '$.providerID') = 'opencode-go'",
+        [start.timestamp_millis()],
+        |row| row.get(0),
+    )?;
+    Ok(LimitWindow {
+        label: label.into(),
+        used_percent: spent / limit * 100.0,
+        resets_at,
+        detail: format!("${spent:.2} of ${limit:.2} · local"),
     })
 }
 
@@ -215,6 +276,7 @@ pub fn capture_claude(input: &str, cache: &Path) -> Result<Vec<LimitWindow>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::OpenCodeGoAllowances;
     use std::io::Write;
     use tempfile::tempdir;
 
@@ -237,5 +299,42 @@ mod tests {
         let windows = capture_claude(input, &cache).unwrap();
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[1].used_percent, 41.2);
+    }
+
+    #[test]
+    fn opencode_go_has_three_windows_and_ignores_other_providers() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("opencode.db");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE message (
+                    id TEXT PRIMARY KEY,
+                    time_created INTEGER NOT NULL,
+                    data TEXT NOT NULL
+                )",
+                [],
+            )
+            .unwrap();
+        let now = Local::now().timestamp_millis();
+        connection
+            .execute(
+                "INSERT INTO message VALUES
+                 ('go', ?1, '{\"providerID\":\"opencode-go\",\"cost\":6.0}'),
+                 ('other', ?1, '{\"providerID\":\"openai\",\"cost\":100.0}')",
+                [now],
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut config = Config::default();
+        config.paths.opencode_db = database;
+        config.allowances.opencode_go = Some(OpenCodeGoAllowances::default());
+        let summary = opencode_quota(&config).unwrap();
+
+        assert_eq!(summary.windows.len(), 3);
+        assert_eq!(summary.windows[0].used_percent, 50.0);
+        assert_eq!(summary.windows[1].used_percent, 20.0);
+        assert_eq!(summary.windows[2].used_percent, 10.0);
     }
 }
