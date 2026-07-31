@@ -2,8 +2,14 @@
 name = "costsee"
 version = "0.1.0"
 edition = "2024"
+# std::fs::File::lock is used for the Claude cache.
+rust-version = "1.89"
 description = "A local-first TUI for AI coding tool allowance usage"
 license = "MIT"
+repository = "https://github.com/lef237/costsee"
+readme = "README.md"
+keywords = ["tui", "usage", "claude", "codex", "opencode"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1"
@@ -11,7 +17,6 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 dirs = "6"
-fs2 = "0.4"
 ratatui = "0.30"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

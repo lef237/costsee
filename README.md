@@ -1,5 +1,7 @@
 # costsee
 
+[![CI](https://github.com/lef237/costsee/actions/workflows/ci.yml/badge.svg)](https://github.com/lef237/costsee/actions/workflows/ci.yml)
+
 Codex、Claude Code、OpenCode の「利用枠を何％使ったか」を一画面で確認する
 Rust 製 TUI です。
 
@@ -30,6 +32,8 @@ OpenCode は複数のプロバイダーを利用でき、共通の契約枠が�
 OpenCode Zen やワークスペースで設定した月間 USD 上限を設定ファイルへ記載します。
 
 ## インストール
+
+ビルドには Rust 1.89 以上が必要です。
 
 ```console
 cargo install --path .
@@ -95,6 +99,9 @@ tool        window   used   reset                       status
 Codex       7 days   2.0%   2026-08-05T20:59:27+09:00  ok
 Claude Code 5 hours  23.5%  2026-07-29T22:00:00+09:00  ok
 ```
+
+取得できたツールが1つも無い場合は、各行に理由を出したうえで終了コード1を返します。
+一部のツールだけ未設定・失敗のときは0のままです。
 
 ## プライバシー
 

@@ -4,7 +4,6 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Local, TimeZone};
-use fs2::FileExt;
 use rusqlite::Connection;
 use serde_json::{Map, Value};
 use std::{
@@ -372,7 +371,7 @@ pub fn capture_claude(input: &str, cache: &Path) -> Result<Vec<LimitWindow>> {
         .write(true)
         .truncate(false)
         .open(&lock_path)?;
-    lock.lock_exclusive()?;
+    lock.lock()?;
 
     let existing = std::fs::read_to_string(cache)
         .ok()
@@ -387,7 +386,7 @@ pub fn capture_claude(input: &str, cache: &Path) -> Result<Vec<LimitWindow>> {
         write_json_atomically(cache, &sanitized)?;
     }
 
-    FileExt::unlock(&lock)?;
+    lock.unlock()?;
     // The capture itself succeeded. Claude Code runs this as its status line, so
     // having nothing to report yet must not fail the command.
     Ok(claude_quota(cache)

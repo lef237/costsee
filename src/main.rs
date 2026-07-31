@@ -35,17 +35,21 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    if matches!(cli.command, Some(Command::Init)) {
-        let path = Config::init(cli.config)?;
-        println!("created {}", path.display());
-        return Ok(());
+    // Neither command reads the config, so a broken one must not block them.
+    match cli.command {
+        Some(Command::Init) => {
+            let path = Config::init(cli.config)?;
+            println!("created {}", path.display());
+            return Ok(());
+        }
+        Some(Command::Setup) => return setup_claude(),
+        _ => {}
     }
     let (config, path) = Config::load(cli.config)?;
     match cli.command {
-        Some(Command::Setup) => setup_claude(),
         Some(Command::CaptureClaude) => capture(&config),
         Some(Command::Report) => report(&config),
-        Some(Command::Init) => unreachable!(),
+        Some(Command::Init | Command::Setup) => unreachable!(),
         None => costsee::ui::run(config, path),
     }
 }
@@ -74,6 +78,15 @@ fn report(config: &Config) -> Result<()> {
                     .unwrap_or_else(|| "-".into())
             );
         }
+    }
+    // Every tool failed, so a caller piping this into something else should see
+    // a failure rather than a header row on its own.
+    if snapshot
+        .tools
+        .values()
+        .all(|summary| summary.windows.is_empty())
+    {
+        anyhow::bail!("no allowance data available");
     }
     Ok(())
 }

@@ -197,56 +197,26 @@ fn note_rows(note: &str, width: u16) -> usize {
 }
 
 fn draw_header(frame: &mut ratatui::Frame, area: Rect, snapshot: &QuotaSnapshot) {
-    let mut spans = vec![
-        Span::styled(
-            " COSTSEE ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-    ];
-    match most_constrained(snapshot) {
-        Some((tool, label, percent)) => {
-            let percent_span = Span::styled(
-                format!("{percent:.0}%"),
-                Style::default()
-                    .fg(level_color(percent))
-                    .add_modifier(Modifier::BOLD),
-            );
-            if area.width >= 56 {
-                spans.push(Span::styled(
-                    "most constrained ",
-                    Style::default().fg(Color::DarkGray),
-                ));
-                spans.push(Span::raw(format!("{} · {}", tool.label(), label)));
-                spans.push(Span::raw("  "));
-                spans.push(percent_span);
-            } else {
-                spans.push(percent_span);
-                spans.push(Span::raw(format!(" {} · {label}", tool.label())));
-            }
-        }
-        None => spans.push(Span::styled(
-            "waiting for usage data",
-            Style::default().fg(Color::Yellow),
-        )),
-    }
-
     let updated = snapshot
         .tools
         .values()
         .filter_map(|summary| summary.updated_at)
         .max()
-        .filter(|_| area.width >= 64)
         .map(|at| format!("updated {} ", at.format("%H:%M")))
         .unwrap_or_default();
+    // Never trade away part of the headline for the timestamp: a wider terminal
+    // must not end up showing less than a narrow one.
+    let updated = if area.width as usize >= headline(snapshot, usize::MAX).width() + updated.len() {
+        updated
+    } else {
+        String::new()
+    };
+    let spans = headline(snapshot, (area.width as usize) - updated.len());
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(0), Constraint::Length(updated.len() as u16)])
         .split(area);
-    frame.render_widget(Paragraph::new(Line::from(spans)), columns[0]);
+    frame.render_widget(Paragraph::new(spans), columns[0]);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             updated,
@@ -254,6 +224,58 @@ fn draw_header(frame: &mut ratatui::Frame, area: Rect, snapshot: &QuotaSnapshot)
         ))),
         columns[1],
     );
+}
+
+/// Builds the widest headline that fits. The percentage is what the dashboard
+/// exists to show, so it is the one part every variant keeps.
+fn headline(snapshot: &QuotaSnapshot, width: usize) -> Line<'static> {
+    let badge = Span::styled(
+        " COSTSEE ",
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
+    let Some((tool, label, percent)) = most_constrained(snapshot) else {
+        return Line::from(vec![
+            badge,
+            Span::raw("  "),
+            Span::styled("waiting for usage data", Style::default().fg(Color::Yellow)),
+        ]);
+    };
+
+    let percent_span = Span::styled(
+        format!("{percent:.0}%"),
+        Style::default()
+            .fg(level_color(percent))
+            .add_modifier(Modifier::BOLD),
+    );
+    let dim = Style::default().fg(Color::DarkGray);
+    let subject = format!("{} · {label}", tool.label());
+    let variants = [
+        Line::from(vec![
+            badge.clone(),
+            Span::raw("  "),
+            Span::styled("most constrained ", dim),
+            Span::raw(subject.clone()),
+            Span::raw("  "),
+            percent_span.clone(),
+        ]),
+        Line::from(vec![
+            badge.clone(),
+            Span::raw("  "),
+            percent_span.clone(),
+            Span::raw(format!(" {subject}")),
+        ]),
+        Line::from(vec![badge, Span::raw("  "), percent_span]),
+    ];
+    let last = variants.len() - 1;
+    variants
+        .into_iter()
+        .enumerate()
+        .find(|(index, line)| *index == last || line.width() <= width)
+        .map(|(_, line)| line)
+        .expect("the last variant is always accepted")
 }
 
 fn draw_footer(
@@ -851,6 +873,37 @@ mod tests {
     }
 
     #[test]
+    fn the_headline_keeps_the_percentage_at_every_width() {
+        let snapshot = snapshot();
+
+        for width in 12usize..=120 {
+            let line = headline(&snapshot, width);
+            let rendered = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+
+            assert!(rendered.contains("93%"), "width {width}: {rendered}");
+            if width >= 24 {
+                assert!(line.width() <= width, "width {width}: {rendered}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_headline_says_so_when_there_is_nothing_to_show() {
+        let empty = QuotaSnapshot::default();
+        let line = headline(&empty, 80);
+
+        assert!(
+            line.spans
+                .iter()
+                .any(|span| span.content.contains("waiting for usage data"))
+        );
+    }
+
+    #[test]
     fn a_note_gets_the_lines_its_length_needs() {
         let note = "unsupported OpenCode database format; update costsee: no such table: message";
 
@@ -883,7 +936,9 @@ mod tests {
             by_key: true,
         };
         let stale = Status::Refreshed {
-            at: Instant::now() - FLASH,
+            at: Instant::now()
+                .checked_sub(FLASH)
+                .expect("a monotonic clock past the flash window"),
             by_key: true,
         };
 
