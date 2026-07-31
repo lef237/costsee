@@ -82,6 +82,10 @@ fn capture(config: &Config) -> Result<()> {
     let mut input = String::new();
     io::stdin().read_to_string(&mut input)?;
     let windows = capture_claude(&input, &config.paths.claude_usage_cache)?;
+    if windows.is_empty() {
+        println!("allowance pending");
+        return Ok(());
+    }
     let status = windows
         .iter()
         .map(|w| format!("{} {:.0}%", w.label, w.used_percent))

@@ -233,16 +233,15 @@ pub fn opencode_quota(config: &Config) -> Result<QuotaSummary> {
     validate_opencode_database(&connection)
         .context("unsupported OpenCode database format; update costsee")?;
     let now = Local::now();
-    let month_start = Local
-        .with_ymd_and_hms(now.year(), now.month(), 1, 0, 0, 0)
-        .single()
-        .context("invalid month start")?;
+    // A daylight-saving change can make local midnight ambiguous or skip it, so
+    // take the first matching instant rather than insisting on a unique one.
+    let month_start = month_boundary(now.year(), now.month()).context("invalid month start")?;
     let (year, month) = if now.month() == 12 {
         (now.year() + 1, 1)
     } else {
         (now.year(), now.month() + 1)
     };
-    let month_reset = Local.with_ymd_and_hms(year, month, 1, 0, 0, 0).single();
+    let month_reset = month_boundary(year, month);
     let mut windows = Vec::new();
 
     if let Some(limits) = go_limits {
@@ -291,6 +290,17 @@ pub fn opencode_quota(config: &Config) -> Result<QuotaSummary> {
         note: None,
         updated_at: Some(now),
     })
+}
+
+fn month_boundary(year: i32, month: u32) -> Option<DateTime<Local>> {
+    Local
+        .with_ymd_and_hms(year, month, 1, 0, 0, 0)
+        .earliest()
+        .or_else(|| {
+            // Midnight itself does not exist in this zone; the window starts as
+            // soon as the clock reaches the new month.
+            Local.with_ymd_and_hms(year, month, 1, 1, 0, 0).earliest()
+        })
 }
 
 fn validate_opencode_database(connection: &Connection) -> Result<()> {
@@ -378,7 +388,11 @@ pub fn capture_claude(input: &str, cache: &Path) -> Result<Vec<LimitWindow>> {
     }
 
     FileExt::unlock(&lock)?;
-    Ok(claude_quota(cache)?.windows)
+    // The capture itself succeeded. Claude Code runs this as its status line, so
+    // having nothing to report yet must not fail the command.
+    Ok(claude_quota(cache)
+        .map(|summary| summary.windows)
+        .unwrap_or_default())
 }
 
 fn valid_claude_window(value: &Value, now: i64) -> Option<(f64, i64)> {
@@ -516,6 +530,16 @@ mod tests {
     }
 
     #[test]
+    fn capturing_before_any_limits_arrive_succeeds_with_no_windows() {
+        let directory = tempdir().unwrap();
+        let cache = directory.path().join("claude.json");
+
+        let windows = capture_claude(r#"{"session_id":"first-message"}"#, &cache).unwrap();
+
+        assert!(windows.is_empty());
+    }
+
+    #[test]
     fn claude_capture_strips_legacy_session_metadata() {
         let directory = tempdir().unwrap();
         let cache = directory.path().join("claude.json");
@@ -650,6 +674,15 @@ mod tests {
         assert_eq!(summary.windows[0].used_percent, 50.0);
         assert_eq!(summary.windows[1].used_percent, 20.0);
         assert_eq!(summary.windows[2].used_percent, 10.0);
+    }
+
+    #[test]
+    fn month_boundaries_resolve_in_every_month() {
+        let now = Local::now();
+
+        for month in 1..=12 {
+            assert!(month_boundary(now.year(), month).is_some(), "month {month}");
+        }
     }
 
     #[test]

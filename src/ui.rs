@@ -16,7 +16,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Paragraph, Wrap},
 };
 use std::{
     io,
@@ -126,6 +126,8 @@ const PERCENT_WIDTH: usize = 4;
 const MIN_BAR: usize = 10;
 const MAX_BAR: usize = 44;
 const LABEL_TIERS: [usize; 3] = [16, 9, 0];
+/// Most a wrapped explanation may grow to before it is left truncated.
+const MAX_NOTE_ROWS: usize = 3;
 const RESET_TIERS: [u16; 3] = [40, 20, 12];
 
 fn draw(
@@ -136,7 +138,10 @@ fn draw(
 ) {
     let mut constraints = vec![Constraint::Length(1), Constraint::Length(1)];
     for tool in Tool::ALL {
-        constraints.push(Constraint::Length(block_height(&snapshot.tools[&tool])));
+        constraints.push(Constraint::Length(block_height(
+            &snapshot.tools[&tool],
+            frame.area().width,
+        )));
     }
     constraints.push(Constraint::Min(0));
     constraints.push(Constraint::Length(1));
@@ -154,8 +159,41 @@ fn draw(
     draw_footer(frame, root[root.len() - 1], config_path, status);
 }
 
-fn block_height(summary: &QuotaSummary) -> u16 {
-    2 + summary.windows.len().max(2) as u16
+fn block_height(summary: &QuotaSummary, width: u16) -> u16 {
+    let rows = if summary.windows.is_empty() {
+        1 + note_rows(note_of(summary), width)
+    } else {
+        summary.windows.len()
+    };
+    2 + rows as u16
+}
+
+fn note_of(summary: &QuotaSummary) -> &str {
+    summary.note.as_deref().unwrap_or("not configured")
+}
+
+/// Counts the lines a wrapped note needs, following the same greedy word wrap
+/// the paragraph uses so the block is neither too short nor padded with blanks.
+fn note_rows(note: &str, width: u16) -> usize {
+    let available = (width as usize).saturating_sub(2 + INDENT).max(1);
+    let mut rows = 1;
+    let mut used = 0;
+    for word in note.split_whitespace() {
+        let length = word.chars().count();
+        if used == 0 {
+            used = length;
+        } else if used + 1 + length <= available {
+            used += 1 + length;
+        } else {
+            rows += 1;
+            used = length;
+        }
+        while used > available {
+            rows += 1;
+            used -= available;
+        }
+    }
+    rows.min(MAX_NOTE_ROWS)
 }
 
 fn draw_header(frame: &mut ratatui::Frame, area: Rect, snapshot: &QuotaSnapshot) {
@@ -346,7 +384,7 @@ fn draw_tool(
 fn draw_missing(frame: &mut ratatui::Frame, inner: Rect, summary: &QuotaSummary) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
         .split(inner);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -355,16 +393,23 @@ fn draw_missing(frame: &mut ratatui::Frame, inner: Rect, summary: &QuotaSummary)
         ])),
         rows[0],
     );
+    // The note is the only place that says what to do next, so wrap it instead
+    // of letting a long message run off the edge of the block.
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::raw(" ".repeat(INDENT)),
-            Span::styled(
-                summary.note.as_deref().unwrap_or("not configured"),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])),
-        rows[1],
+        Paragraph::new(note_of(summary))
+            .style(Style::default().fg(Color::DarkGray))
+            .wrap(Wrap { trim: true }),
+        indented(rows[1]),
     );
+}
+
+fn indented(area: Rect) -> Rect {
+    let indent = INDENT as u16;
+    Rect {
+        x: area.x + indent.min(area.width),
+        width: area.width.saturating_sub(indent),
+        ..area
+    }
 }
 
 fn block_meta(summary: &QuotaSummary, width: u16) -> Option<String> {
@@ -803,6 +848,32 @@ mod tests {
         assert_eq!(bar_fill(50.0, 20), 10);
         assert_eq!(bar_fill(100.0, 20), 20);
         assert_eq!(bar_fill(12.0, 0), 0);
+    }
+
+    #[test]
+    fn a_note_gets_the_lines_its_length_needs() {
+        let note = "unsupported OpenCode database format; update costsee: no such table: message";
+
+        assert_eq!(note_rows(note, 80), 1);
+        assert_eq!(note_rows(note, 60), 2);
+        assert_eq!(note_rows(note, 40), 3);
+        assert_eq!(note_rows(note, 20), MAX_NOTE_ROWS);
+        assert_eq!(note_rows("short", 80), 1);
+        assert_eq!(note_rows(note, 0), MAX_NOTE_ROWS);
+        assert_eq!(note_rows("", 80), 1);
+    }
+
+    #[test]
+    fn a_block_is_tall_enough_for_what_it_shows() {
+        let mut summary = QuotaSummary {
+            note: Some("set `allowances.opencode_go` in config".into()),
+            ..QuotaSummary::default()
+        };
+        assert_eq!(block_height(&summary, 80), 4);
+        assert_eq!(block_height(&summary, 30), 6);
+
+        summary.windows = vec![window("5 hours", 1.0, "detail")];
+        assert_eq!(block_height(&summary, 80), 3);
     }
 
     #[test]
