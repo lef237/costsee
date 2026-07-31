@@ -36,7 +36,9 @@ cargo install --path .
 costsee
 ```
 
-`r` で再読込、`q` または `Esc` で終了します。
+`r` で再読込、`q` または `Esc` で終了します。再読込の間はフッターに
+`refreshing…`、完了すると `✓ refreshed` を数秒間表示します。Claude Code の
+利用率が更新されて自動で読み直したときは `✓ auto-refreshed` になります。
 
 ## 初期設定
 

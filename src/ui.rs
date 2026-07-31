@@ -18,7 +18,10 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
 };
-use std::{io, time::Duration};
+use std::{
+    io,
+    time::{Duration, Instant},
+};
 
 pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
     enable_raw_mode()?;
@@ -40,13 +43,19 @@ fn app_loop(
 ) -> Result<()> {
     let mut snapshot = collect_quotas(&config);
     let mut claude_cache_modified = cache_modified(&config.paths.claude_usage_cache);
+    let mut status = Status::Idle;
     loop {
-        terminal.draw(|frame| draw(frame, &snapshot, &config_path))?;
+        terminal.draw(|frame| draw(frame, &snapshot, &config_path, status))?;
+        status = status.expired();
         if !event::poll(Duration::from_millis(500))? {
             let modified = cache_modified(&config.paths.claude_usage_cache);
             if modified != claude_cache_modified {
                 snapshot = collect_quotas(&config);
                 claude_cache_modified = modified;
+                status = Status::Refreshed {
+                    at: Instant::now(),
+                    by_key: false,
+                };
             }
             continue;
         }
@@ -57,14 +66,52 @@ fn app_loop(
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => break,
                 KeyCode::Char('r') => {
+                    // Collecting can block on the Codex app server, so say so first.
+                    status = Status::Refreshing;
+                    terminal.draw(|frame| draw(frame, &snapshot, &config_path, status))?;
                     snapshot = collect_quotas(&config);
                     claude_cache_modified = cache_modified(&config.paths.claude_usage_cache);
+                    status = Status::Refreshed {
+                        at: Instant::now(),
+                        by_key: true,
+                    };
                 }
                 _ => {}
             }
         }
     }
     Ok(())
+}
+
+const FLASH: Duration = Duration::from_secs(3);
+/// Room the footer always keeps for a status label, so the config path below
+/// does not appear and disappear as the status changes.
+const STATUS_WIDTH: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Status {
+    Idle,
+    Refreshing,
+    Refreshed { at: Instant, by_key: bool },
+}
+
+impl Status {
+    /// Drops a refresh confirmation once it has been on screen long enough.
+    fn expired(self) -> Self {
+        match self {
+            Status::Refreshed { at, .. } if at.elapsed() >= FLASH => Status::Idle,
+            other => other,
+        }
+    }
+
+    fn label(self) -> Option<(&'static str, Color)> {
+        match self {
+            Status::Idle => None,
+            Status::Refreshing => Some(("refreshing…", Color::Yellow)),
+            Status::Refreshed { by_key: true, .. } => Some(("✓ refreshed", Color::Green)),
+            Status::Refreshed { by_key: false, .. } => Some(("✓ auto-refreshed", Color::Green)),
+        }
+    }
 }
 
 fn cache_modified(path: &std::path::Path) -> Option<std::time::SystemTime> {
@@ -81,7 +128,12 @@ const MAX_BAR: usize = 44;
 const LABEL_TIERS: [usize; 3] = [16, 9, 0];
 const RESET_TIERS: [u16; 3] = [40, 20, 12];
 
-fn draw(frame: &mut ratatui::Frame, snapshot: &QuotaSnapshot, config_path: &std::path::Path) {
+fn draw(
+    frame: &mut ratatui::Frame,
+    snapshot: &QuotaSnapshot,
+    config_path: &std::path::Path,
+    status: Status,
+) {
     let mut constraints = vec![Constraint::Length(1), Constraint::Length(1)];
     for tool in Tool::ALL {
         constraints.push(Constraint::Length(block_height(&snapshot.tools[&tool])));
@@ -99,7 +151,7 @@ fn draw(frame: &mut ratatui::Frame, snapshot: &QuotaSnapshot, config_path: &std:
     for (index, tool) in Tool::ALL.into_iter().enumerate() {
         draw_tool(frame, root[index + 2], snapshot, tool, &columns, now);
     }
-    draw_footer(frame, root[root.len() - 1], config_path);
+    draw_footer(frame, root[root.len() - 1], config_path, status);
 }
 
 fn block_height(summary: &QuotaSummary) -> u16 {
@@ -166,28 +218,37 @@ fn draw_header(frame: &mut ratatui::Frame, area: Rect, snapshot: &QuotaSnapshot)
     );
 }
 
-fn draw_footer(frame: &mut ratatui::Frame, area: Rect, config_path: &std::path::Path) {
+fn draw_footer(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    config_path: &std::path::Path,
+    status: Status,
+) {
     let key = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(Color::DarkGray);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::raw(" "),
-            Span::styled("r", key),
-            Span::styled(" refresh   ", dim),
-            Span::styled("q", key),
-            Span::styled(" quit", dim),
-        ])),
-        area,
-    );
+    let mut keys = vec![
+        Span::raw(" "),
+        Span::styled("r", key),
+        Span::styled(" refresh   ", dim),
+        Span::styled("q", key),
+        Span::styled(" quit", dim),
+    ];
+    let reserved = Line::from(keys.clone()).width() + GAP + STATUS_WIDTH;
+    if let Some((text, color)) = status.label() {
+        keys.push(Span::raw(" ".repeat(GAP)));
+        keys.push(Span::styled(text, Style::default().fg(color)));
+    }
+
     let path = format!("{} ", config_path.display());
-    if area.width as usize > path.chars().count() + 24 {
+    if area.width as usize > reserved + path.chars().count() + 4 {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(path, dim)).right_aligned()),
             area,
         );
     }
+    frame.render_widget(Paragraph::new(Line::from(keys)), area);
 }
 
 fn most_constrained(snapshot: &QuotaSnapshot) -> Option<(Tool, &str, f64)> {
@@ -742,6 +803,67 @@ mod tests {
         assert_eq!(bar_fill(50.0, 20), 10);
         assert_eq!(bar_fill(100.0, 20), 20);
         assert_eq!(bar_fill(12.0, 0), 0);
+    }
+
+    #[test]
+    fn a_refresh_confirmation_fades_but_refreshing_stays() {
+        let fresh = Status::Refreshed {
+            at: Instant::now(),
+            by_key: true,
+        };
+        let stale = Status::Refreshed {
+            at: Instant::now() - FLASH,
+            by_key: true,
+        };
+
+        assert_eq!(fresh.expired(), fresh);
+        assert_eq!(stale.expired(), Status::Idle);
+        assert_eq!(Status::Refreshing.expired(), Status::Refreshing);
+        assert_eq!(Status::Idle.expired(), Status::Idle);
+    }
+
+    #[test]
+    fn every_status_label_fits_the_reserved_footer_space() {
+        for status in [
+            Status::Refreshing,
+            Status::Refreshed {
+                at: Instant::now(),
+                by_key: true,
+            },
+            Status::Refreshed {
+                at: Instant::now(),
+                by_key: false,
+            },
+        ] {
+            let (text, _) = status.label().expect("a visible status");
+            assert!(text.chars().count() <= STATUS_WIDTH, "{text}");
+        }
+    }
+
+    #[test]
+    fn only_a_busy_or_recent_refresh_shows_a_label() {
+        assert_eq!(Status::Idle.label(), None);
+        assert_eq!(Status::Refreshing.label().unwrap().0, "refreshing…");
+        assert_eq!(
+            Status::Refreshed {
+                at: Instant::now(),
+                by_key: true,
+            }
+            .label()
+            .unwrap()
+            .0,
+            "✓ refreshed"
+        );
+        assert_eq!(
+            Status::Refreshed {
+                at: Instant::now(),
+                by_key: false,
+            }
+            .label()
+            .unwrap()
+            .0,
+            "✓ auto-refreshed"
+        );
     }
 
     #[test]
