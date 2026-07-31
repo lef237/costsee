@@ -7,8 +7,9 @@ Rust 製 TUI です。
  COSTSEE  allowance dashboard   most constrained 41% used
 
  ┌ Codex · team ────────────────────────────────────────────────┐
- │ 7 days  resets Wed 20:59                                    │
+ │ period  7 days | left 5d 20h                                │
  │ ███████░░░░░░░░░░░░░░░░░░░░░░░░░░░  20% used · 80% left   │
+ │ reset   2026-08-05 20:59                                    │
  └──────────────────────────────────────────────────────────────┘
 ```
 

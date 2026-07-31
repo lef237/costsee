@@ -4,7 +4,7 @@ use crate::{
     model::{LimitWindow, QuotaSnapshot, Tool},
 };
 use anyhow::Result;
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Duration as ChronoDuration, Local};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
@@ -191,20 +191,24 @@ fn draw_window(
             Constraint::Length(1),
         ])
         .split(area);
-    let reset = window
-        .resets_at
-        .map(|at| at.format("%a %H:%M").to_string())
-        .unwrap_or_else(|| "unknown".into());
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!("{}  ", window.label),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(format!("resets {reset}")),
-        ])),
-        rows[0],
-    );
+    let now = Local::now();
+    let remaining = reset_remaining(window.resets_at, now);
+    let heading = if area.width >= 32 {
+        Line::from(vec![
+            Span::raw("period  "),
+            Span::styled(&window.label, Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" | left "),
+            Span::styled(remaining, Style::default().add_modifier(Modifier::BOLD)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::raw("left "),
+            Span::styled(remaining, Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" | "),
+            Span::styled(&window.label, Style::default().add_modifier(Modifier::BOLD)),
+        ])
+    };
+    frame.render_widget(Paragraph::new(heading), rows[0]);
     let percent = window.used_percent.clamp(0.0, 100.0);
     let color = if percent >= 90.0 {
         Color::Red
@@ -226,18 +230,115 @@ fn draw_window(
     );
     frame.render_widget(
         Paragraph::new(Span::styled(
-            &window.detail,
+            reset_date(window.resets_at, area.width),
             Style::default().fg(Color::DarkGray),
         )),
         rows[2],
     );
-    if let Some(updated) = updated_at {
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                format!("updated {}", updated.format("%m/%d %H:%M")),
-                Style::default().fg(Color::DarkGray),
-            )),
-            rows[3],
+    let detail = updated_at
+        .map(|updated| {
+            format!(
+                "{} · updated {}",
+                window.detail,
+                updated.format("%m/%d %H:%M")
+            )
+        })
+        .unwrap_or_else(|| window.detail.clone());
+    frame.render_widget(
+        Paragraph::new(Span::styled(detail, Style::default().fg(Color::DarkGray))),
+        rows[3],
+    );
+}
+
+fn reset_remaining(resets_at: Option<DateTime<Local>>, now: DateTime<Local>) -> String {
+    resets_at
+        .map(|at| remaining_reset_time(at.signed_duration_since(now)))
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn reset_date(resets_at: Option<DateTime<Local>>, width: u16) -> String {
+    resets_at
+        .map(|at| {
+            if width >= 24 {
+                format!("reset   {}", at.format("%Y-%m-%d %H:%M"))
+            } else if width >= 16 {
+                format!("reset {}", at.format("%Y-%m-%d"))
+            } else {
+                at.format("%Y-%m-%d").to_string()
+            }
+        })
+        .unwrap_or_else(|| "reset   unknown".into())
+}
+
+fn remaining_reset_time(remaining: ChronoDuration) -> String {
+    let seconds = remaining.num_seconds();
+    if seconds <= 0 {
+        return "expired".into();
+    }
+    if seconds < 60 {
+        return "<1m".into();
+    }
+
+    let total_minutes = seconds / 60;
+    let days = total_minutes / (24 * 60);
+    let hours = (total_minutes / 60) % 24;
+    let minutes = total_minutes % 60;
+
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else {
+        format!("{minutes}m")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_remaining_reports_time_left() {
+        let now = Local::now();
+        let resets_at = now + ChronoDuration::hours(2) + ChronoDuration::minutes(5);
+
+        assert_eq!(reset_remaining(Some(resets_at), now), "2h 5m");
+    }
+
+    #[test]
+    fn reset_date_omits_time_in_narrow_columns() {
+        let resets_at = Local::now();
+
+        assert_eq!(
+            reset_date(Some(resets_at), 24),
+            format!("reset   {}", resets_at.format("%Y-%m-%d %H:%M"))
         );
+        assert_eq!(
+            reset_date(Some(resets_at), 23),
+            format!("reset {}", resets_at.format("%Y-%m-%d"))
+        );
+        assert_eq!(
+            reset_date(Some(resets_at), 15),
+            resets_at.format("%Y-%m-%d").to_string()
+        );
+    }
+
+    #[test]
+    fn remaining_reset_time_uses_compact_units() {
+        assert_eq!(
+            remaining_reset_time(
+                ChronoDuration::days(2) + ChronoDuration::hours(3) + ChronoDuration::minutes(45)
+            ),
+            "2d 3h"
+        );
+        assert_eq!(remaining_reset_time(ChronoDuration::minutes(45)), "45m");
+        assert_eq!(remaining_reset_time(ChronoDuration::seconds(30)), "<1m");
+        assert_eq!(remaining_reset_time(ChronoDuration::zero()), "expired");
+    }
+
+    #[test]
+    fn reset_fields_handle_unknown_reset_time() {
+        assert_eq!(reset_remaining(None, Local::now()), "unknown");
+        assert_eq!(reset_date(None, 80), "reset   unknown");
     }
 }
