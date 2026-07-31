@@ -1,7 +1,7 @@
 use crate::{
     collect::collect_quotas,
     config::Config,
-    model::{LimitWindow, QuotaSnapshot, Tool},
+    model::{LimitWindow, QuotaSnapshot, QuotaSummary, Tool},
 };
 use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, Local};
@@ -16,7 +16,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, Paragraph},
+    widgets::{Block, Borders, Paragraph},
 };
 use std::{io, time::Duration};
 
@@ -73,181 +73,469 @@ fn cache_modified(path: &std::path::Path) -> Option<std::time::SystemTime> {
         .and_then(|metadata| metadata.modified().ok())
 }
 
+const INDENT: usize = 2;
+const GAP: usize = 2;
+const PERCENT_WIDTH: usize = 4;
+const MIN_BAR: usize = 10;
+const MAX_BAR: usize = 44;
+const LABEL_TIERS: [usize; 3] = [16, 9, 0];
+const RESET_TIERS: [u16; 3] = [40, 20, 12];
+
 fn draw(frame: &mut ratatui::Frame, snapshot: &QuotaSnapshot, config_path: &std::path::Path) {
+    let mut constraints = vec![Constraint::Length(1), Constraint::Length(1)];
+    for tool in Tool::ALL {
+        constraints.push(Constraint::Length(block_height(&snapshot.tools[&tool])));
+    }
+    constraints.push(Constraint::Min(0));
+    constraints.push(Constraint::Length(1));
     let root = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(6),
-            Constraint::Length(6),
-            Constraint::Length(6),
-            Constraint::Min(2),
-        ])
+        .constraints(constraints)
         .split(frame.area());
 
-    let highest = snapshot
-        .tools
-        .values()
-        .flat_map(|summary| &summary.windows)
-        .map(|window| window.used_percent)
-        .reduce(f64::max);
-    let headline = highest
-        .map(|value| format!("most constrained  {value:.0}% used"))
-        .unwrap_or_else(|| "waiting for usage data".into());
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                " COSTSEE ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  allowance dashboard   "),
-            Span::styled(headline, Style::default().fg(Color::Yellow)),
-        ]))
-        .block(Block::default().borders(Borders::BOTTOM)),
-        root[0],
-    );
-
+    let now = Local::now();
+    let columns = columns(snapshot, frame.area().width.saturating_sub(2) as usize, now);
+    draw_header(frame, root[0], snapshot);
     for (index, tool) in Tool::ALL.into_iter().enumerate() {
-        draw_tool(frame, root[index + 1], snapshot, tool);
+        draw_tool(frame, root[index + 2], snapshot, tool, &columns, now);
+    }
+    draw_footer(frame, root[root.len() - 1], config_path);
+}
+
+fn block_height(summary: &QuotaSummary) -> u16 {
+    2 + summary.windows.len().max(2) as u16
+}
+
+fn draw_header(frame: &mut ratatui::Frame, area: Rect, snapshot: &QuotaSnapshot) {
+    let mut spans = vec![
+        Span::styled(
+            " COSTSEE ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+    ];
+    match most_constrained(snapshot) {
+        Some((tool, label, percent)) => {
+            let percent_span = Span::styled(
+                format!("{percent:.0}%"),
+                Style::default()
+                    .fg(level_color(percent))
+                    .add_modifier(Modifier::BOLD),
+            );
+            if area.width >= 56 {
+                spans.push(Span::styled(
+                    "most constrained ",
+                    Style::default().fg(Color::DarkGray),
+                ));
+                spans.push(Span::raw(format!("{} · {}", tool.label(), label)));
+                spans.push(Span::raw("  "));
+                spans.push(percent_span);
+            } else {
+                spans.push(percent_span);
+                spans.push(Span::raw(format!(" {} · {label}", tool.label())));
+            }
+        }
+        None => spans.push(Span::styled(
+            "waiting for usage data",
+            Style::default().fg(Color::Yellow),
+        )),
     }
 
+    let updated = snapshot
+        .tools
+        .values()
+        .filter_map(|summary| summary.updated_at)
+        .max()
+        .filter(|_| area.width >= 64)
+        .map(|at| format!("updated {} ", at.format("%H:%M")))
+        .unwrap_or_default();
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(updated.len() as u16)])
+        .split(area);
+    frame.render_widget(Paragraph::new(Line::from(spans)), columns[0]);
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" r", Style::default().fg(Color::Cyan)),
-            Span::raw(" refresh  "),
-            Span::styled("q", Style::default().fg(Color::Cyan)),
-            Span::raw(" quit   "),
-            Span::styled(
-                config_path.display().to_string(),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])),
-        root[4],
+        Paragraph::new(Line::from(Span::styled(
+            updated,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        columns[1],
     );
 }
 
-fn draw_tool(frame: &mut ratatui::Frame, area: Rect, snapshot: &QuotaSnapshot, tool: Tool) {
-    let summary = &snapshot.tools[&tool];
-    let title = summary
-        .plan
-        .as_deref()
-        .map(|plan| format!(" {} · {} ", tool.label(), plan))
-        .unwrap_or_else(|| format!(" {} ", tool.label()));
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(if summary.windows.is_empty() {
-            Color::DarkGray
-        } else {
-            Color::Cyan
-        }));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    if summary.windows.is_empty() {
+fn draw_footer(frame: &mut ratatui::Frame, area: Rect, config_path: &std::path::Path) {
+    let key = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::DarkGray);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw(" "),
+            Span::styled("r", key),
+            Span::styled(" refresh   ", dim),
+            Span::styled("q", key),
+            Span::styled(" quit", dim),
+        ])),
+        area,
+    );
+    let path = format!("{} ", config_path.display());
+    if area.width as usize > path.chars().count() + 24 {
         frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(Span::styled(
-                    "usage percentage unavailable",
-                    Style::default().fg(Color::Yellow),
-                )),
-                Line::from(summary.note.as_deref().unwrap_or("no data")),
-            ]),
-            inner,
+            Paragraph::new(Line::from(Span::styled(path, dim)).right_aligned()),
+            area,
         );
-        return;
     }
+}
 
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(
+fn most_constrained(snapshot: &QuotaSnapshot) -> Option<(Tool, &str, f64)> {
+    snapshot
+        .tools
+        .iter()
+        .flat_map(|(tool, summary)| {
             summary
                 .windows
                 .iter()
-                .map(|_| Constraint::Ratio(1, summary.windows.len() as u32))
-                .collect::<Vec<_>>(),
-        )
-        .split(inner);
-    for (index, window) in summary.windows.iter().enumerate() {
-        draw_window(frame, columns[index], window, summary.updated_at);
-    }
+                .map(move |window| (*tool, window.label.as_str(), window.used_percent))
+        })
+        .max_by(|left, right| left.2.total_cmp(&right.2))
 }
 
-fn draw_window(
-    frame: &mut ratatui::Frame,
-    area: Rect,
-    window: &LimitWindow,
-    updated_at: Option<DateTime<Local>>,
-) {
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
-        .split(area);
-    let now = Local::now();
-    let remaining = reset_remaining(window.resets_at, now);
-    let heading = if area.width >= 32 {
-        Line::from(vec![
-            Span::raw("period  "),
-            Span::styled(&window.label, Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" | left "),
-            Span::styled(remaining, Style::default().add_modifier(Modifier::BOLD)),
-        ])
-    } else {
-        Line::from(vec![
-            Span::raw("left "),
-            Span::styled(remaining, Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" | "),
-            Span::styled(&window.label, Style::default().add_modifier(Modifier::BOLD)),
-        ])
-    };
-    frame.render_widget(Paragraph::new(heading), rows[0]);
-    let percent = window.used_percent.clamp(0.0, 100.0);
-    let color = if percent >= 90.0 {
+fn level_color(percent: f64) -> Color {
+    if percent >= 90.0 {
         Color::Red
     } else if percent >= 70.0 {
         Color::Yellow
     } else {
         Color::Green
-    };
+    }
+}
+
+fn border_color(worst: Option<f64>) -> Color {
+    match worst {
+        Some(percent) if percent >= 90.0 => Color::Red,
+        Some(percent) if percent >= 70.0 => Color::Yellow,
+        _ => Color::DarkGray,
+    }
+}
+
+fn draw_tool(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    snapshot: &QuotaSnapshot,
+    tool: Tool,
+    columns: &Columns,
+    now: DateTime<Local>,
+) {
+    let summary = &snapshot.tools[&tool];
+    let worst = summary
+        .windows
+        .iter()
+        .map(|window| window.used_percent)
+        .reduce(f64::max);
+    let mut title = vec![
+        Span::raw(" "),
+        Span::styled(tool.label(), Style::default().add_modifier(Modifier::BOLD)),
+    ];
+    if let Some(plan) = summary.plan.as_deref() {
+        title.push(Span::styled(
+            format!(" · {plan}"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    title.push(Span::raw(" "));
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color(worst)))
+        .title_top(Line::from(title));
+    if let Some(meta) = block_meta(summary, area.width) {
+        block = block.title_top(
+            Line::from(Span::styled(
+                format!(" {meta} "),
+                Style::default().fg(Color::DarkGray),
+            ))
+            .right_aligned(),
+        );
+    }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if summary.windows.is_empty() {
+        draw_missing(frame, inner, summary);
+        return;
+    }
+
+    let plan = meta_plan(&summary.windows, columns);
+    // A short terminal drops trailing windows instead of leaving gaps between them.
+    let visible = summary.windows.len().min(inner.height as usize);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(vec![Constraint::Length(1); visible])
+        .split(inner);
+    for (index, window) in summary.windows.iter().take(visible).enumerate() {
+        frame.render_widget(
+            Paragraph::new(window_line(window, columns, &plan, now)),
+            rows[index],
+        );
+    }
+}
+
+fn draw_missing(frame: &mut ratatui::Frame, inner: Rect, summary: &QuotaSummary) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(inner);
     frame.render_widget(
-        Gauge::default()
-            .gauge_style(Style::default().fg(color))
-            .ratio(percent / 100.0)
-            .label(format!(
-                "{:.0}% used · {:.0}% left",
-                percent,
-                100.0 - percent
-            )),
+        Paragraph::new(Line::from(vec![
+            Span::raw(" ".repeat(INDENT)),
+            Span::styled("no usage data", Style::default().fg(Color::Yellow)),
+        ])),
+        rows[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw(" ".repeat(INDENT)),
+            Span::styled(
+                summary.note.as_deref().unwrap_or("not configured"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])),
         rows[1],
     );
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            reset_date(window.resets_at, area.width),
-            Style::default().fg(Color::DarkGray),
-        )),
-        rows[2],
-    );
-    let detail = updated_at
-        .map(|updated| {
-            format!(
-                "{} · updated {}",
-                window.detail,
-                updated.format("%m/%d %H:%M")
-            )
+}
+
+fn block_meta(summary: &QuotaSummary, width: u16) -> Option<String> {
+    if width < 68 {
+        return None;
+    }
+    match (uniform_detail(&summary.windows), summary.updated_at) {
+        (Some(source), Some(at)) => {
+            Some(format!("{source} · updated {}", at.format("%m/%d %H:%M")))
+        }
+        (Some(source), None) => Some(source.to_string()),
+        (None, Some(at)) => Some(format!("updated {}", at.format("%m/%d %H:%M"))),
+        (None, None) => None,
+    }
+}
+
+/// A detail shared by every window belongs in the block title, not in each row.
+fn uniform_detail(windows: &[LimitWindow]) -> Option<&str> {
+    let first = windows.first()?.detail.as_str();
+    windows
+        .iter()
+        .all(|window| window.detail == first)
+        .then_some(first)
+}
+
+/// Widths shared by every tool, so bars and percentages line up across blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Columns {
+    label: usize,
+    bar: usize,
+    remaining: usize,
+    meta: usize,
+}
+
+fn columns(snapshot: &QuotaSnapshot, width: usize, now: DateTime<Local>) -> Columns {
+    let windows = || snapshot.tools.values().flat_map(|summary| &summary.windows);
+    let widest_label = windows()
+        .map(|window| window.label.chars().count())
+        .max()
+        .unwrap_or(0);
+    let label = LABEL_TIERS
+        .into_iter()
+        .map(|tier| widest_label.min(tier))
+        .find(|label| width >= prefix_width(*label) + MIN_BAR)
+        .unwrap_or(0);
+
+    let available = width.saturating_sub(prefix_width(label));
+    let remaining = windows()
+        .map(|window| remaining_text(window, now).chars().count())
+        .max()
+        .unwrap_or(0);
+    let wanted_meta = windows()
+        .map(|window| {
+            GAP + remaining + GAP + reset_date(window.resets_at, RESET_TIERS[1]).chars().count()
         })
-        .unwrap_or_else(|| window.detail.clone());
-    frame.render_widget(
-        Paragraph::new(Span::styled(detail, Style::default().fg(Color::DarkGray))),
-        rows[3],
-    );
+        .max()
+        .unwrap_or(0);
+    let bar = available
+        .saturating_sub(wanted_meta)
+        .clamp(MIN_BAR, MAX_BAR)
+        .min(available);
+    Columns {
+        label,
+        bar,
+        remaining,
+        meta: available - bar,
+    }
+}
+
+fn prefix_width(label: usize) -> usize {
+    let optional = |value: usize| if value > 0 { GAP + value } else { 0 };
+    INDENT + optional(label) + GAP + PERCENT_WIDTH + 1
+}
+
+/// Which trailing columns one tool can afford inside the shared meta budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MetaPlan {
+    detail: usize,
+    remaining: usize,
+    reset_hint: u16,
+}
+
+fn meta_plan(windows: &[LimitWindow], columns: &Columns) -> MetaPlan {
+    let budget = columns.meta;
+    let detail = match uniform_detail(windows) {
+        Some(_) => 0,
+        None => windows
+            .iter()
+            .map(|window| window.detail.chars().count())
+            .max()
+            .unwrap_or(0),
+    };
+    let remaining = columns.remaining;
+    let mut plan = MetaPlan {
+        detail,
+        remaining,
+        reset_hint: RESET_TIERS[0],
+    };
+
+    let mut tier = 1;
+    while meta_width(&plan, windows) > budget {
+        if tier < RESET_TIERS.len() {
+            plan.reset_hint = RESET_TIERS[tier];
+            tier += 1;
+        } else if plan.reset_hint > 0 {
+            plan.reset_hint = 0;
+        } else if plan.remaining > 0 {
+            plan.remaining = 0;
+        } else if plan.detail > 0 {
+            plan.detail = budget.saturating_sub(GAP);
+            break;
+        } else {
+            break;
+        }
+    }
+    if plan.detail > 0 && meta_width(&plan, windows) > budget {
+        plan.detail = 0;
+    }
+    plan
+}
+
+fn meta_width(plan: &MetaPlan, windows: &[LimitWindow]) -> usize {
+    let optional = |value: usize| if value > 0 { GAP + value } else { 0 };
+    optional(plan.detail) + optional(plan.remaining) + optional(reset_width(plan, windows))
+}
+
+fn reset_width(plan: &MetaPlan, windows: &[LimitWindow]) -> usize {
+    if plan.reset_hint == 0 {
+        return 0;
+    }
+    windows
+        .iter()
+        .map(|window| {
+            reset_date(window.resets_at, plan.reset_hint)
+                .chars()
+                .count()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn remaining_text(window: &LimitWindow, now: DateTime<Local>) -> String {
+    format!("left {}", reset_remaining(window.resets_at, now))
+}
+
+fn window_line(
+    window: &LimitWindow,
+    columns: &Columns,
+    plan: &MetaPlan,
+    now: DateTime<Local>,
+) -> Line<'static> {
+    let percent = window.used_percent.clamp(0.0, 100.0);
+    let color = level_color(percent);
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut spans = vec![Span::raw(" ".repeat(INDENT))];
+    if columns.label > 0 {
+        spans.push(Span::styled(
+            format!(
+                "{:>width$}",
+                fit(&window.label, columns.label),
+                width = columns.label
+            ),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" ".repeat(GAP)));
+    }
+
+    let filled = bar_fill(percent, columns.bar);
+    spans.push(Span::styled("█".repeat(filled), Style::default().fg(color)));
+    spans.push(Span::styled(
+        "░".repeat(columns.bar - filled),
+        Style::default().fg(Color::DarkGray),
+    ));
+    spans.push(Span::raw(" ".repeat(GAP)));
+    spans.push(Span::styled(
+        format!("{percent:>3.0}%"),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    ));
+
+    if plan.detail > 0 {
+        spans.push(Span::raw(" ".repeat(GAP)));
+        spans.push(Span::styled(
+            format!(
+                "{:<width$}",
+                fit(&window.detail, plan.detail),
+                width = plan.detail
+            ),
+            dim,
+        ));
+    }
+    if plan.remaining > 0 {
+        spans.push(Span::raw(" ".repeat(GAP)));
+        spans.push(Span::styled(
+            format!(
+                "{:<width$}",
+                remaining_text(window, now),
+                width = plan.remaining
+            ),
+            dim,
+        ));
+    }
+    if plan.reset_hint > 0 {
+        spans.push(Span::raw(" ".repeat(GAP)));
+        spans.push(Span::styled(
+            reset_date(window.resets_at, plan.reset_hint),
+            dim,
+        ));
+    }
+    Line::from(spans)
+}
+
+/// Rounds to the nearest cell, but keeps any non-zero usage visible.
+fn bar_fill(percent: f64, width: usize) -> usize {
+    if width == 0 {
+        return 0;
+    }
+    let filled = (percent / 100.0 * width as f64).round() as usize;
+    if percent > 0.0 {
+        filled.clamp(1, width)
+    } else {
+        filled.min(width)
+    }
+}
+
+fn fit(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    text.chars()
+        .take(width.saturating_sub(1))
+        .collect::<String>()
+        + "…"
 }
 
 fn reset_remaining(resets_at: Option<DateTime<Local>>, now: DateTime<Local>) -> String {
@@ -259,15 +547,15 @@ fn reset_remaining(resets_at: Option<DateTime<Local>>, now: DateTime<Local>) -> 
 fn reset_date(resets_at: Option<DateTime<Local>>, width: u16) -> String {
     resets_at
         .map(|at| {
-            if width >= 24 {
-                format!("reset   {}", at.format("%Y-%m-%d %H:%M"))
-            } else if width >= 16 {
-                format!("reset {}", at.format("%Y-%m-%d"))
+            if width >= 22 {
+                format!("reset {}", at.format("%Y-%m-%d %H:%M"))
+            } else if width >= 17 {
+                format!("reset {}", at.format("%m-%d %H:%M"))
             } else {
-                at.format("%Y-%m-%d").to_string()
+                format!("reset {}", at.format("%m-%d"))
             }
         })
-        .unwrap_or_else(|| "reset   unknown".into())
+        .unwrap_or_else(|| "reset unknown".into())
 }
 
 fn remaining_reset_time(remaining: ChronoDuration) -> String {
@@ -296,6 +584,7 @@ fn remaining_reset_time(remaining: ChronoDuration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[test]
     fn reset_remaining_reports_time_left() {
@@ -306,21 +595,30 @@ mod tests {
     }
 
     #[test]
-    fn reset_date_omits_time_in_narrow_columns() {
+    fn reset_date_drops_year_then_time_in_narrow_columns() {
         let resets_at = Local::now();
 
         assert_eq!(
-            reset_date(Some(resets_at), 24),
-            format!("reset   {}", resets_at.format("%Y-%m-%d %H:%M"))
+            reset_date(Some(resets_at), 22),
+            format!("reset {}", resets_at.format("%Y-%m-%d %H:%M"))
         );
         assert_eq!(
-            reset_date(Some(resets_at), 23),
-            format!("reset {}", resets_at.format("%Y-%m-%d"))
+            reset_date(Some(resets_at), 21),
+            format!("reset {}", resets_at.format("%m-%d %H:%M"))
         );
         assert_eq!(
-            reset_date(Some(resets_at), 15),
-            resets_at.format("%Y-%m-%d").to_string()
+            reset_date(Some(resets_at), 16),
+            format!("reset {}", resets_at.format("%m-%d"))
         );
+    }
+
+    #[test]
+    fn reset_date_fits_the_width_it_was_given() {
+        let resets_at = Local::now();
+
+        for tier in RESET_TIERS {
+            assert!(reset_date(Some(resets_at), tier).chars().count() <= tier as usize);
+        }
     }
 
     #[test]
@@ -339,6 +637,117 @@ mod tests {
     #[test]
     fn reset_fields_handle_unknown_reset_time() {
         assert_eq!(reset_remaining(None, Local::now()), "unknown");
-        assert_eq!(reset_date(None, 80), "reset   unknown");
+        assert_eq!(reset_date(None, 80), "reset unknown");
+    }
+
+    fn window(label: &str, percent: f64, detail: &str) -> LimitWindow {
+        LimitWindow {
+            label: label.into(),
+            used_percent: percent,
+            resets_at: Some(Local::now() + ChronoDuration::hours(3)),
+            detail: detail.into(),
+        }
+    }
+
+    fn snapshot() -> QuotaSnapshot {
+        let mut tools = BTreeMap::new();
+        tools.insert(
+            Tool::Codex,
+            QuotaSummary {
+                windows: vec![
+                    window("5 hours", 12.0, "Codex App Server"),
+                    window("spend control", 4.0, "Codex App Server"),
+                ],
+                ..QuotaSummary::default()
+            },
+        );
+        tools.insert(
+            Tool::Claude,
+            QuotaSummary {
+                windows: vec![window("7 days", 93.0, "reported by Claude Code")],
+                ..QuotaSummary::default()
+            },
+        );
+        tools.insert(
+            Tool::OpenCode,
+            QuotaSummary {
+                windows: vec![
+                    window("5 hours", 8.0, "$0.98 of $12.00 · local"),
+                    window("This week", 55.0, "$16.50 of $30.00 · local"),
+                ],
+                ..QuotaSummary::default()
+            },
+        );
+        QuotaSnapshot { tools }
+    }
+
+    #[test]
+    fn every_tool_shares_one_bar_width() {
+        let snapshot = snapshot();
+
+        for width in [40usize, 56, 80, 120, 200] {
+            let columns = columns(&snapshot, width, Local::now());
+
+            assert!(columns.bar >= MIN_BAR.min(width));
+            assert!(columns.bar <= MAX_BAR);
+            assert!(prefix_width(columns.label) + columns.bar + columns.meta <= width);
+        }
+    }
+
+    #[test]
+    fn rows_never_exceed_the_terminal_width() {
+        let snapshot = snapshot();
+        let now = Local::now();
+
+        for width in [24usize, 40, 56, 80, 120] {
+            let columns = columns(&snapshot, width, now);
+            for summary in snapshot.tools.values() {
+                let plan = meta_plan(&summary.windows, &columns);
+                for window in &summary.windows {
+                    let rendered = window_line(window, &columns, &plan, now).width();
+                    assert!(rendered <= width, "{rendered} > {width}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_terminals_drop_trailing_columns_before_the_bar() {
+        let snapshot = snapshot();
+        let wide = columns(&snapshot, 120, Local::now());
+        let narrow = columns(&snapshot, 44, Local::now());
+
+        assert!(wide.meta > narrow.meta);
+        assert_eq!(narrow.bar, MIN_BAR);
+    }
+
+    #[test]
+    fn a_shared_detail_moves_into_the_block_title() {
+        let snapshot = snapshot();
+        let columns = columns(&snapshot, 100, Local::now());
+
+        let codex = &snapshot.tools[&Tool::Codex];
+        assert_eq!(uniform_detail(&codex.windows), Some("Codex App Server"));
+        assert_eq!(meta_plan(&codex.windows, &columns).detail, 0);
+
+        let opencode = &snapshot.tools[&Tool::OpenCode];
+        assert_eq!(uniform_detail(&opencode.windows), None);
+        assert!(meta_plan(&opencode.windows, &columns).detail > 0);
+    }
+
+    #[test]
+    fn bar_keeps_any_non_zero_usage_visible() {
+        assert_eq!(bar_fill(0.0, 20), 0);
+        assert_eq!(bar_fill(0.4, 20), 1);
+        assert_eq!(bar_fill(50.0, 20), 10);
+        assert_eq!(bar_fill(100.0, 20), 20);
+        assert_eq!(bar_fill(12.0, 0), 0);
+    }
+
+    #[test]
+    fn fit_truncates_with_an_ellipsis() {
+        assert_eq!(fit("5 hours", 9), "5 hours");
+        assert_eq!(fit("spend control", 9), "spend co…");
+        assert_eq!(fit("日本語のラベル", 4), "日本語…");
     }
 }
