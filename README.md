@@ -2,8 +2,8 @@
 
 [![CI](https://github.com/lef237/costsee/actions/workflows/ci.yml/badge.svg)](https://github.com/lef237/costsee/actions/workflows/ci.yml)
 
-Codex、Claude Code、OpenCode の「利用枠を何％使ったか」を一画面で確認する
-Rust 製 TUI です。
+A Rust TUI that shows how much of your Codex, Claude Code, and OpenCode
+allowances you have used—all in one place.
 
 ```text
  COSTSEE   most constrained Claude Code · 7 days  93%             updated 18:08
@@ -19,53 +19,68 @@ Rust 製 TUI です。
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-バーの長さはツールをまたいで共通なので、ブロック間で消化率をそのまま見比べら
-れます。枠線は 70% を超えると黄色、90% を超えると赤に変わります。
+Bar widths are consistent across tools, so usage can be compared directly
+between blocks. Borders turn yellow above 70% usage and red above 90%.
 
-## 対応する利用枠
+## Supported allowances
 
-- Codex: 公式 App Server が提供する5時間・7日間などの消化率
-- Claude Code: 公式ステータスラインが提供する5時間・7日間の消化率
-- OpenCode: ローカル履歴の記録済みコスト ÷ 設定した上限
+- Codex: usage percentages for five-hour, seven-day, and other windows reported
+  by the official App Server
+- Claude Code: five-hour and seven-day usage percentages reported by the
+  official status line
+- OpenCode: recorded local cost divided by configured spending limits
 
-OpenCode は複数のプロバイダーを利用でき、共通の契約枠が存在しません。そのため
-OpenCode Zen やワークスペースで設定した月間 USD 上限を設定ファイルへ記載します。
+OpenCode supports multiple providers and does not have a single shared
+allowance. Configure the monthly USD limit for OpenCode Zen or your workspace
+in the configuration file.
 
-## インストール
+## Installation
 
-ビルドには Rust 1.89 以上が必要です。
+Rust 1.89 or later is required to build costsee.
+
+From crates.io:
+
+```console
+cargo install costsee
+costsee
+```
+
+From a local checkout:
 
 ```console
 cargo install --path .
 costsee
 ```
 
-`r` で再読込、`q` または `Esc` で終了します。再読込の間はフッターに
-`refreshing…`、完了すると `✓ refreshed` を数秒間表示します。Claude Code の
-利用率が更新されて自動で読み直したときは `✓ auto-refreshed` になります。
+Press `r` to refresh and `q` or `Esc` to quit. While a refresh is running, the
+footer shows `refreshing…`; after completion it briefly shows `✓ refreshed`.
+When costsee reloads automatically after Claude Code updates its usage data, it
+shows `✓ auto-refreshed`.
 
-## 初期設定
+## Setup
 
-Codex は追加設定なしで検出します。Claude Code の公式利用率フィードを接続します。
+Codex is detected without additional configuration. Connect Claude Code's
+official status-line usage feed with:
 
 ```console
 costsee setup
 ```
 
-これは `~/.claude/settings.json` に `statusLine` が未設定の場合だけ設定を追加します。
-既存のステータスラインは上書きしません。接続後、Claude Code で一度メッセージを
-送ると利用率が保存されます。
+This adds a `statusLine` entry to `~/.claude/settings.json` only when one is not
+already configured. It never overwrites an existing status line. After setup,
+send one message in Claude Code to save the latest usage data.
 
-以前のバージョンから更新した場合も `costsee setup` を再実行してください。
-アイドル中の古いClaude Codeセッションによる定期更新を無効化します。
+If you are upgrading from an earlier version, run `costsee setup` again. This
+disables periodic updates from old, idle Claude Code sessions.
 
-OpenCode Go の期間別上限を設定する場合:
+To configure time-window limits for OpenCode Go, run:
 
 ```console
 costsee init
 ```
 
-生成された設定に追記します。以下は OpenCode Go の公式上限です。
+Then add the following official OpenCode Go limits to the generated
+configuration:
 
 ```toml
 [allowances.opencode_go]
@@ -74,21 +89,22 @@ weekly_usd = 30.0
 monthly_usd = 60.0
 ```
 
-OpenCode Go のローカル履歴だけを対象に、直近5時間、直近7日間、今月の記録済み
-コストから利用率を推定します。5時間・週間枠の正確なリセット時刻はローカル履歴から
-取得できないため、画面では `unknown` と表示します。既存の
-`allowances.opencode_monthly_usd` も月間表示用として引き続き利用できます。
+For OpenCode Go, costsee estimates usage from the recorded cost in local
+OpenCode Go history over the last five hours, the last seven days, and the
+current calendar month. Local history does not provide exact reset times for
+the five-hour and weekly windows, so the UI displays `unknown`. The existing
+`allowances.opencode_monthly_usd` setting remains supported for monthly usage.
 
-標準の設定場所はOSによらず `~/.config/costsee/config.toml` です。
-`--config` で別の場所も指定できます。
-`codex` が `PATH` にない場合は、設定の `[commands]` に実行ファイルのパスを指定できます。
+The default configuration path is `~/.config/costsee/config.toml` on every
+operating system. Use `--config` to specify a different path. If `codex` is not
+on `PATH`, set its executable path under `[commands]`:
 
 ```toml
 [commands]
 codex = "/path/to/codex"
 ```
 
-## 非対話レポート
+## Non-interactive reports
 
 ```console
 costsee report
@@ -100,21 +116,27 @@ Codex       7 days   2.0%   2026-08-05T20:59:27+09:00  ok
 Claude Code 5 hours  23.5%  2026-07-29T22:00:00+09:00  ok
 ```
 
-取得できたツールが1つも無い場合は、各行に理由を出したうえで終了コード1を返します。
-一部のツールだけ未設定・失敗のときは0のままです。
+If no tool can be read, costsee prints the reason on each row and exits with
+status 1. If at least one tool succeeds, unavailable or unconfigured tools do
+not change the exit status from 0.
 
-## プライバシー
+## Privacy
 
-- Codex の公式 App Server をstdioで一時起動し、`account/rateLimits/read` の結果だけを
-  取得します。セッションログや認証情報は読み取りません。
-- OpenCode のローカルSQLiteデータベースから、時刻・provider・costだけを読み取り専用で
-  集計します。会話本文は取得しません。
-- Claude Code の公式ステータスライン入力から、利用率とリセット時刻だけをローカルに
-  キャッシュします。作業ディレクトリ、セッションID、transcriptパスなどは保存しません。
-- API キーは取得せず、非公開APIへのアクセスやテレメトリー送信も行いません。Codex
-  App Serverによる公式利用率の取得は、Codex自身の既存認証を使用します。
-- OpenCodeについては、会話本文を取得せず期間別集計の精度を保てる公式APIがないため、
-  ローカルDBアクセスを隔離して使用しています。未対応の形式では推測値を表示しません。
-- 利用率は各 CLI が最後に報告した値です。Claude Code のキャッシュ更新は起動中の
-  costsee に自動反映されます。ほかの値は各 CLI で一度通信した後、costsee で `r` を
-  押してください。
+- For Codex, costsee temporarily starts the official App Server over stdio and
+  reads only the result of `account/rateLimits/read`. It does not read session
+  logs or credentials.
+- For OpenCode, costsee reads only timestamps, providers, and costs from the
+  local SQLite database in read-only mode. It does not read conversation text.
+- For Claude Code, costsee caches only usage percentages and reset times from
+  the official status-line input. It does not save the working directory,
+  session ID, transcript path, or other session metadata.
+- costsee does not collect API keys, call private APIs, or send telemetry. The
+  official Codex App Server uses Codex's existing authentication when costsee
+  requests rate-limit data.
+- OpenCode does not provide an official API that supports accurate time-window
+  aggregation without reading conversation text. For that reason, local
+  database access is isolated, and costsee does not display estimates for
+  unsupported data formats.
+- Usage values are the latest values reported by each CLI. Claude Code cache
+  updates are reflected automatically while costsee is running. For other
+  tools, communicate with the CLI once and then press `r` in costsee.

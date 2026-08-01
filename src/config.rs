@@ -102,7 +102,7 @@ impl Config {
         let raw = toml::to_string_pretty(&Self::default())?.replacen(
             "[allowances]\n",
             "[allowances]\n\
-             # OpenCode Goを使う場合は次のコメントを外してください。\n\
+             # Uncomment the following section to use OpenCode Go.\n\
              # [allowances.opencode_go]\n\
              # five_hour_usd = 12.0\n\
              # weekly_usd = 30.0\n\
