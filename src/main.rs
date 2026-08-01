@@ -1,8 +1,10 @@
 use anyhow::Result;
+use chrono::Local;
 use clap::{Parser, Subcommand};
 use costsee::{
     collect::{capture_claude, collect_quotas},
     config::Config,
+    statusline,
 };
 use std::{
     fs,
@@ -95,16 +97,18 @@ fn capture(config: &Config) -> Result<()> {
     let mut input = String::new();
     io::stdin().read_to_string(&mut input)?;
     let windows = capture_claude(&input, &config.paths.claude_usage_cache)?;
-    if windows.is_empty() {
-        println!("allowance pending");
-        return Ok(());
-    }
-    let status = windows
-        .iter()
-        .map(|w| format!("{} {:.0}%", w.label, w.used_percent))
-        .collect::<Vec<_>>()
-        .join(" · ");
-    println!("allowance {status}");
+    // The capture already validated the payload, so a session without any
+    // recognizable fields still renders the allowance line on its own.
+    let session = serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
+    println!(
+        "{}",
+        statusline::render(
+            &session,
+            &windows,
+            Local::now(),
+            statusline::Palette::detect()
+        )
+    );
     Ok(())
 }
 

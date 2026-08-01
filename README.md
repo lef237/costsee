@@ -73,6 +73,22 @@ send one message in Claude Code to save the latest usage data.
 If you are upgrading from an earlier version, run `costsee setup` again. This
 disables periodic updates from old, idle Claude Code sessions.
 
+## Status line
+
+While it records usage data, costsee also draws Claude Code's status line. The
+first row describes the session and the second the subscription allowances,
+with the same bars and level colors as the dashboard:
+
+```text
+Opus · costsee · ctx ███░░░░░░░  28% · $1.23
+5h ████████░░  78% left 58m · 7d █████████░  93% left 1d 22h
+```
+
+Every part of the first row is omitted while Claude Code has nothing to report,
+so a fresh session starts with the model name alone and fills in as it runs.
+Until the first API response returns allowance data, the second row reads
+`allowance pending`. Set `NO_COLOR` to render the status line without colors.
+
 To configure time-window limits for OpenCode Go, run:
 
 ```console
@@ -128,8 +144,9 @@ not change the exit status from 0.
 - For OpenCode, costsee reads only timestamps, providers, and costs from the
   local SQLite database in read-only mode. It does not read conversation text.
 - For Claude Code, costsee caches only usage percentages and reset times from
-  the official status-line input. It does not save the working directory,
-  session ID, transcript path, or other session metadata.
+  the official status-line input. The model, directory, context, and cost shown
+  in the status line are drawn straight from that input and never written to
+  disk, and the session ID and transcript path are neither displayed nor saved.
 - costsee does not collect API keys, call private APIs, or send telemetry. The
   official Codex App Server uses Codex's existing authentication when costsee
   requests rate-limit data.

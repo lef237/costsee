@@ -1,10 +1,11 @@
 use crate::{
     collect::collect_quotas,
     config::Config,
+    format::{CRITICAL_PERCENT, WARNING_PERCENT, bar_fill, remaining_reset_time},
     model::{LimitWindow, QuotaSnapshot, QuotaSummary, Tool},
 };
 use anyhow::Result;
-use chrono::{DateTime, Duration as ChronoDuration, Local};
+use chrono::{DateTime, Local};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
@@ -325,9 +326,9 @@ fn most_constrained(snapshot: &QuotaSnapshot) -> Option<(Tool, &str, f64)> {
 }
 
 fn level_color(percent: f64) -> Color {
-    if percent >= 90.0 {
+    if percent >= CRITICAL_PERCENT {
         Color::Red
-    } else if percent >= 70.0 {
+    } else if percent >= WARNING_PERCENT {
         Color::Yellow
     } else {
         Color::Green
@@ -336,8 +337,8 @@ fn level_color(percent: f64) -> Color {
 
 fn border_color(worst: Option<f64>) -> Color {
     match worst {
-        Some(percent) if percent >= 90.0 => Color::Red,
-        Some(percent) if percent >= 70.0 => Color::Yellow,
+        Some(percent) if percent >= CRITICAL_PERCENT => Color::Red,
+        Some(percent) if percent >= WARNING_PERCENT => Color::Yellow,
         _ => Color::DarkGray,
     }
 }
@@ -643,19 +644,6 @@ fn window_line(
     Line::from(spans)
 }
 
-/// Rounds to the nearest cell, but keeps any non-zero usage visible.
-fn bar_fill(percent: f64, width: usize) -> usize {
-    if width == 0 {
-        return 0;
-    }
-    let filled = (percent / 100.0 * width as f64).round() as usize;
-    if percent > 0.0 {
-        filled.clamp(1, width)
-    } else {
-        filled.min(width)
-    }
-}
-
 fn fit(text: &str, width: usize) -> String {
     if text.chars().count() <= width {
         return text.to_string();
@@ -686,32 +674,10 @@ fn reset_date(resets_at: Option<DateTime<Local>>, width: u16) -> String {
         .unwrap_or_else(|| "reset unknown".into())
 }
 
-fn remaining_reset_time(remaining: ChronoDuration) -> String {
-    let seconds = remaining.num_seconds();
-    if seconds <= 0 {
-        return "expired".into();
-    }
-    if seconds < 60 {
-        return "<1m".into();
-    }
-
-    let total_minutes = seconds / 60;
-    let days = total_minutes / (24 * 60);
-    let hours = (total_minutes / 60) % 24;
-    let minutes = total_minutes % 60;
-
-    if days > 0 {
-        format!("{days}d {hours}h")
-    } else if hours > 0 {
-        format!("{hours}h {minutes}m")
-    } else {
-        format!("{minutes}m")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration as ChronoDuration;
     use std::collections::BTreeMap;
 
     #[test]
@@ -747,19 +713,6 @@ mod tests {
         for tier in RESET_TIERS {
             assert!(reset_date(Some(resets_at), tier).chars().count() <= tier as usize);
         }
-    }
-
-    #[test]
-    fn remaining_reset_time_uses_compact_units() {
-        assert_eq!(
-            remaining_reset_time(
-                ChronoDuration::days(2) + ChronoDuration::hours(3) + ChronoDuration::minutes(45)
-            ),
-            "2d 3h"
-        );
-        assert_eq!(remaining_reset_time(ChronoDuration::minutes(45)), "45m");
-        assert_eq!(remaining_reset_time(ChronoDuration::seconds(30)), "<1m");
-        assert_eq!(remaining_reset_time(ChronoDuration::zero()), "expired");
     }
 
     #[test]
@@ -861,15 +814,6 @@ mod tests {
         let opencode = &snapshot.tools[&Tool::OpenCode];
         assert_eq!(uniform_detail(&opencode.windows), None);
         assert!(meta_plan(&opencode.windows, &columns).detail > 0);
-    }
-
-    #[test]
-    fn bar_keeps_any_non_zero_usage_visible() {
-        assert_eq!(bar_fill(0.0, 20), 0);
-        assert_eq!(bar_fill(0.4, 20), 1);
-        assert_eq!(bar_fill(50.0, 20), 10);
-        assert_eq!(bar_fill(100.0, 20), 20);
-        assert_eq!(bar_fill(12.0, 0), 0);
     }
 
     #[test]
