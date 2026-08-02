@@ -6,6 +6,7 @@
 
 use crate::{
     format::{CRITICAL_PERCENT, WARNING_PERCENT, bar_fill, remaining_reset_time},
+    git,
     model::LimitWindow,
 };
 use chrono::{DateTime, Local};
@@ -13,6 +14,8 @@ use serde_json::Value;
 use std::path::Path;
 
 const BAR_WIDTH: usize = 10;
+/// Long branch names would push the allowances off the edge of the terminal.
+const BRANCH_WIDTH: usize = 24;
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "1";
 const DIM: &str = "90";
@@ -71,11 +74,11 @@ pub fn render(
 
 fn session_segments(input: &Value, palette: Palette) -> Vec<String> {
     let mut segments = Vec::new();
-    if let Some(model) = input["model"]["display_name"].as_str() {
-        segments.push(palette.paint(BOLD, model));
+    if let Some(model) = model_segment(input, palette) {
+        segments.push(model);
     }
-    if let Some(directory) = workspace_name(input) {
-        segments.push(palette.paint(CYAN, &directory));
+    if let Some(workspace) = workspace_segment(input, palette) {
+        segments.push(workspace);
     }
     if let Some(percent) = percentage(&input["context_window"]["used_percentage"]) {
         segments.push(format!(
@@ -88,6 +91,67 @@ fn session_segments(input: &Value, palette: Palette) -> Vec<String> {
         segments.push(palette.paint(DIM, &format!("${cost:.2}")));
     }
     segments
+}
+
+/// The model, followed by whatever changes how it answers. Only the settings
+/// that differ from a plain session earn the width, so `high` effort is worth
+/// showing while the `default` output style is not.
+fn model_segment(input: &Value, palette: Palette) -> Option<String> {
+    let model = palette.paint(BOLD, input["model"]["display_name"].as_str()?);
+    let mut modes = Vec::new();
+    // Claude Code omits the effort field entirely for models without one.
+    if let Some(effort) = input["effort"]["level"].as_str() {
+        modes.push(effort);
+    }
+    if input["fast_mode"].as_bool() == Some(true) {
+        modes.push("fast");
+    }
+    if input["thinking"]["enabled"].as_bool() == Some(false) {
+        modes.push("think off");
+    }
+    if let Some(style) = input["output_style"]["name"]
+        .as_str()
+        .filter(|style| *style != "default")
+    {
+        modes.push(style);
+    }
+    if modes.is_empty() {
+        return Some(model);
+    }
+    Some(format!(
+        "{model}{}",
+        palette.paint(DIM, &format!("[{}]", modes.join(", ")))
+    ))
+}
+
+/// The directory the session runs in, with its branch when there is one.
+fn workspace_segment(input: &Value, palette: Palette) -> Option<String> {
+    let workspace = palette.paint(CYAN, &workspace_name(input)?);
+    let Some(branch) = branch(input) else {
+        return Some(workspace);
+    };
+    Some(format!(
+        "{workspace}{}",
+        palette.paint(DIM, &format!("({branch})"))
+    ))
+}
+
+/// Claude Code reports a branch only for the worktrees it manages itself, so an
+/// ordinary session is resolved against the repository it runs in.
+fn branch(input: &Value) -> Option<String> {
+    let branch = match input["worktree"]["branch"].as_str() {
+        Some(branch) => branch.to_string(),
+        None => git::branch(Path::new(current_dir(input)?))?,
+    };
+    Some(shorten(&branch, BRANCH_WIDTH))
+}
+
+fn shorten(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        return value.to_string();
+    }
+    let kept: String = value.chars().take(width.saturating_sub(1)).collect();
+    format!("{kept}…")
 }
 
 fn allowance_line(
@@ -145,10 +209,14 @@ fn short_label(label: &str) -> String {
     }
 }
 
-fn workspace_name(input: &Value) -> Option<String> {
-    let directory = input["workspace"]["current_dir"]
+fn current_dir(input: &Value) -> Option<&str> {
+    input["workspace"]["current_dir"]
         .as_str()
-        .or_else(|| input["cwd"].as_str())?;
+        .or_else(|| input["cwd"].as_str())
+}
+
+fn workspace_name(input: &Value) -> Option<String> {
+    let directory = current_dir(input)?;
     let path = Path::new(directory);
     Some(
         path.file_name()
@@ -173,6 +241,7 @@ fn cost_usd(input: &Value) -> Option<f64> {
 mod tests {
     use super::*;
     use chrono::Duration as ChronoDuration;
+    use tempfile::tempdir;
 
     fn plain() -> Palette {
         Palette { colored: false }
@@ -212,6 +281,81 @@ mod tests {
         assert_eq!(
             lines[1],
             "5h ████████░░  78% left 59m · 7d █████████░  93% left 1d 23h"
+        );
+    }
+
+    #[test]
+    fn brackets_the_settings_that_change_how_the_model_answers() {
+        let now = Local::now();
+        let input = serde_json::json!({
+            "model": {"display_name": "Opus"},
+            "effort": {"level": "high"},
+            "fast_mode": true,
+            "thinking": {"enabled": false},
+            "output_style": {"name": "explanatory"}
+        });
+
+        let rendered = render(&input, &windows(now), now, plain());
+
+        assert!(rendered.starts_with("Opus[high, fast, think off, explanatory]"));
+    }
+
+    #[test]
+    fn a_plain_session_brackets_nothing() {
+        let now = Local::now();
+        let input = serde_json::json!({
+            "model": {"display_name": "Opus"},
+            "fast_mode": false,
+            "thinking": {"enabled": true},
+            "output_style": {"name": "default"}
+        });
+
+        let rendered = render(&input, &windows(now), now, plain());
+
+        assert_eq!(rendered.lines().next(), Some("Opus"));
+    }
+
+    #[test]
+    fn the_branch_follows_the_directory_it_belongs_to() {
+        let now = Local::now();
+        let repository = tempdir().unwrap();
+        std::fs::create_dir(repository.path().join(".git")).unwrap();
+        std::fs::write(
+            repository.path().join(".git/HEAD"),
+            "ref: refs/heads/status-line\n",
+        )
+        .unwrap();
+        let name = repository
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let input = serde_json::json!({
+            "workspace": {"current_dir": repository.path()}
+        });
+
+        let rendered = render(&input, &windows(now), now, plain());
+
+        assert_eq!(
+            rendered.lines().next(),
+            Some(format!("{name}(status-line)").as_str())
+        );
+    }
+
+    #[test]
+    fn a_managed_worktree_reports_its_own_branch_without_touching_the_disk() {
+        let now = Local::now();
+        let input = serde_json::json!({
+            "workspace": {"current_dir": "/nowhere/costsee"},
+            "worktree": {"branch": "review/very-long-branch-name-here"}
+        });
+
+        let rendered = render(&input, &windows(now), now, plain());
+
+        assert_eq!(
+            rendered.lines().next(),
+            Some("costsee(review/very-long-branch…)")
         );
     }
 

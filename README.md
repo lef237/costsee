@@ -80,9 +80,16 @@ first row describes the session and the second the subscription allowances,
 with the same bars and level colors as the dashboard:
 
 ```text
-Opus · costsee · ctx ███░░░░░░░  28% · $1.23
+Opus[high] · costsee(main) · ctx ███░░░░░░░  28% · $1.23
 5h ████████░░  78% left 58m · 7d █████████░  93% left 1d 22h
 ```
+
+The brackets after the model hold the settings that change how it answers, and
+only the ones that differ from a plain session appear: the reasoning effort
+level, `fast` while fast mode is on, `think off` while thinking is disabled, and
+the output style whenever it is not `default`. The parentheses after the
+directory hold the branch checked out there, abbreviated to the commit when
+`HEAD` is detached and shortened to 24 characters when the name runs long.
 
 Every part of the first row is omitted while Claude Code has nothing to report,
 so a fresh session starts with the model name alone and fills in as it runs.
@@ -147,6 +154,8 @@ not change the exit status from 0.
   the official status-line input. The model, directory, context, and cost shown
   in the status line are drawn straight from that input and never written to
   disk, and the session ID and transcript path are neither displayed nor saved.
+  The branch is read from the repository's own `HEAD` file, without running
+  `git` and without touching commits, remotes, or working-tree contents.
 - costsee does not collect API keys, call private APIs, or send telemetry. The
   official Codex App Server uses Codex's existing authentication when costsee
   requests rate-limit data.
