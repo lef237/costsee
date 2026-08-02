@@ -33,6 +33,16 @@ pub fn collect_quotas(config: &Config) -> QuotaSnapshot {
     snapshot
 }
 
+/// Reloads Claude Code alone, for the refresh its cache triggers by itself.
+/// Collecting every tool would start the Codex app server, which answers in
+/// seconds, and the dashboard writes that cache on every Claude Code message.
+pub fn refresh_claude(config: &Config, snapshot: &mut QuotaSnapshot) {
+    snapshot.tools.insert(
+        Tool::Claude,
+        claude_quota(&config.paths.claude_usage_cache).unwrap_or_else(error_summary),
+    );
+}
+
 fn error_summary(err: anyhow::Error) -> QuotaSummary {
     QuotaSummary {
         note: Some(format!("{err:#}")),
@@ -620,6 +630,45 @@ mod tests {
             summary.windows[0].resets_at.unwrap().timestamp(),
             now + 18_000
         );
+    }
+
+    #[test]
+    fn refreshing_claude_leaves_every_other_tool_alone() {
+        let directory = tempdir().unwrap();
+        let cache = directory.path().join("claude.json");
+        let now = Local::now().timestamp();
+        std::fs::write(
+            &cache,
+            serde_json::json!({
+                "rate_limits": {
+                    "five_hour": {"used_percentage": 12.0, "resets_at": now + 3_600}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.paths.claude_usage_cache = cache;
+        // Collecting Codex too would replace its summary with this failure.
+        config.commands.codex = "/nonexistent/codex".into();
+        let mut snapshot = QuotaSnapshot::default();
+        snapshot.tools.insert(
+            Tool::Codex,
+            QuotaSummary {
+                windows: vec![LimitWindow {
+                    label: "7 days".into(),
+                    used_percent: 41.0,
+                    resets_at: None,
+                    detail: "Codex App Server".into(),
+                }],
+                ..QuotaSummary::default()
+            },
+        );
+
+        refresh_claude(&config, &mut snapshot);
+
+        assert_eq!(snapshot.tools[&Tool::Claude].windows[0].used_percent, 12.0);
+        assert_eq!(snapshot.tools[&Tool::Codex].windows[0].used_percent, 41.0);
     }
 
     #[test]

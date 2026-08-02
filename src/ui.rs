@@ -1,5 +1,5 @@
 use crate::{
-    collect::collect_quotas,
+    collect::{collect_quotas, refresh_claude},
     config::Config,
     format::{CRITICAL_PERCENT, WARNING_PERCENT, bar_fill, remaining_reset_time},
     model::{LimitWindow, QuotaSnapshot, QuotaSummary, Tool},
@@ -7,6 +7,7 @@ use crate::{
 use anyhow::Result;
 use chrono::{DateTime, Local};
 use crossterm::{
+    cursor::Show,
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -28,13 +29,29 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
+    install_panic_hook();
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let result = app_loop(&mut terminal, config, config_path);
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    restore_terminal();
     result
+}
+
+/// A panic in the draw loop would otherwise leave the terminal in raw mode and
+/// on the alternate screen, hiding the very message the panic just printed.
+fn install_panic_hook() {
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        report(info);
+    }));
+}
+
+/// Undoes everything `run` set up. Each step is attempted on its own, so a
+/// terminal that refuses one of them still gets the rest.
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
 }
 
 fn app_loop(
@@ -51,7 +68,9 @@ fn app_loop(
         if !event::poll(Duration::from_millis(500))? {
             let modified = cache_modified(&config.paths.claude_usage_cache);
             if modified != claude_cache_modified {
-                snapshot = collect_quotas(&config);
+                // Only the cache that changed is reread, so this stays fast
+                // enough to keep the dashboard answering keys.
+                refresh_claude(&config, &mut snapshot);
                 claude_cache_modified = modified;
                 status = Status::Refreshed {
                     at: Instant::now(),
