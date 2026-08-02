@@ -13,7 +13,7 @@ allowances you have used—all in one place.
 │         7 days  █████████░░░░░░░░░░░░   41%  left 4d 23h   reset 08-05 18:08 │
 │  spend control  █░░░░░░░░░░░░░░░░░░░░    4%  left 19d 23h  reset 08-20 18:08 │
 └──────────────────────────────────────────────────────────────────────────────┘
-┌ Claude Code · max ──────────── reported by Claude Code · updated 07/31 18:08 ┐
+┌ Claude Code ────────────────── reported by Claude Code · updated 07/31 18:08 ┐
 │        5 hours  ████████████████░░░░░   78%  left 59m      reset 07-31 19:08 │
 │         7 days  ████████████████████░   93%  left 1d 23h   reset 08-02 18:08 │
 └──────────────────────────────────────────────────────────────────────────────┘
