@@ -1,5 +1,5 @@
 use crate::{
-    collect::{collect_quotas, refresh_claude},
+    collect::{collect_codex, collect_quotas, refresh_claude},
     config::Config,
     format::{CRITICAL_PERCENT, WARNING_PERCENT, bar_fill, remaining_reset_time},
     model::{LimitWindow, QuotaSnapshot, QuotaSummary, Tool},
@@ -22,6 +22,8 @@ use ratatui::{
 };
 use std::{
     io,
+    sync::mpsc,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -61,6 +63,15 @@ fn app_loop(
 ) -> Result<()> {
     let mut snapshot = collect_quotas(&config);
     let mut claude_cache_modified = cache_modified(&config.paths.claude_usage_cache);
+    // The App Server takes seconds to answer, so Codex is reread on a worker
+    // thread and its result is folded in when it arrives. Each request carries
+    // the generation it was started for, so a slow one cannot overwrite a
+    // newer read (a manual `r` bumps the generation too).
+    let (codex_sender, codex_receiver) = mpsc::channel::<(u64, QuotaSummary)>();
+    let mut codex_generation = 0u64;
+    let mut codex_in_flight = false;
+    let mut last_codex_refresh = Instant::now();
+    let codex_interval = Duration::from_secs(config.refresh_interval_secs.max(1));
     let mut status = Status::Idle;
     loop {
         terminal.draw(|frame| draw(frame, &snapshot, &config_path, status))?;
@@ -72,6 +83,29 @@ fn app_loop(
                 // enough to keep the dashboard answering keys.
                 refresh_claude(&config, &mut snapshot);
                 claude_cache_modified = modified;
+                status = Status::Refreshed {
+                    at: Instant::now(),
+                    by_key: false,
+                };
+            }
+            // A manual refresh resets the timer, so this only fires when the
+            // App Server has not been asked for its interval.
+            if !codex_in_flight && last_codex_refresh.elapsed() >= codex_interval {
+                codex_in_flight = true;
+                codex_generation += 1;
+                let generation = codex_generation;
+                let sender = codex_sender.clone();
+                let config = config.clone();
+                thread::spawn(move || {
+                    let _ = sender.send((generation, collect_codex(&config)));
+                });
+            }
+            if let Ok((generation, summary)) = codex_receiver.try_recv()
+                && generation == codex_generation
+            {
+                snapshot.tools.insert(Tool::Codex, summary);
+                last_codex_refresh = Instant::now();
+                codex_in_flight = false;
                 status = Status::Refreshed {
                     at: Instant::now(),
                     by_key: false,
@@ -91,6 +125,11 @@ fn app_loop(
                     terminal.draw(|frame| draw(frame, &snapshot, &config_path, status))?;
                     snapshot = collect_quotas(&config);
                     claude_cache_modified = cache_modified(&config.paths.claude_usage_cache);
+                    // A pending background result belongs to an older window;
+                    // the fresh read just replaced it, so it is dropped on arrival.
+                    codex_in_flight = false;
+                    codex_generation += 1;
+                    last_codex_refresh = Instant::now();
                     status = Status::Refreshed {
                         at: Instant::now(),
                         by_key: true,

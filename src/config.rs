@@ -2,12 +2,25 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     pub allowances: Allowances,
     pub commands: Commands,
     pub paths: Paths,
+    /// How often the dashboard rereads Codex usage from the App Server.
+    pub refresh_interval_secs: u64,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            allowances: Allowances::default(),
+            commands: Commands::default(),
+            paths: Paths::default(),
+            refresh_interval_secs: 60,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -99,16 +112,22 @@ impl Config {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let raw = toml::to_string_pretty(&Self::default())?.replacen(
-            "[allowances]\n",
-            "[allowances]\n\
-             # Uncomment the following section to use OpenCode Go.\n\
-             # [allowances.opencode_go]\n\
-             # five_hour_usd = 12.0\n\
-             # weekly_usd = 30.0\n\
-             # monthly_usd = 60.0\n",
-            1,
-        );
+        let raw = toml::to_string_pretty(&Self::default())?
+            .replacen(
+                "[allowances]\n",
+                "[allowances]\n\
+                 # Uncomment the following section to use OpenCode Go.\n\
+                 # [allowances.opencode_go]\n\
+                 # five_hour_usd = 12.0\n\
+                 # weekly_usd = 30.0\n\
+                 # monthly_usd = 60.0\n",
+                1,
+            )
+            .replacen(
+                "refresh_interval_secs = 60\n",
+                "# How often costsee rereads Codex usage from the App Server.\nrefresh_interval_secs = 60\n",
+                1,
+            );
         fs::write(&path, raw)?;
         Ok(path)
     }
@@ -125,5 +144,21 @@ mod tests {
             Config::path_from_home(Path::new("/home/alice")),
             PathBuf::from("/home/alice/.config/costsee/config.toml")
         );
+    }
+
+    #[test]
+    fn default_refresh_interval_is_one_minute() {
+        assert_eq!(Config::default().refresh_interval_secs, 60);
+    }
+
+    #[test]
+    fn a_custom_refresh_interval_survives_a_round_trip() {
+        let config = Config {
+            refresh_interval_secs: 30,
+            ..Config::default()
+        };
+        let raw = toml::to_string(&config).unwrap();
+        let parsed: Config = toml::from_str(&raw).unwrap();
+        assert_eq!(parsed.refresh_interval_secs, 30);
     }
 }

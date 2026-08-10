@@ -54,8 +54,10 @@ costsee
 
 Press `r` to refresh and `q` or `Esc` to quit. While a refresh is running, the
 footer shows `refreshing…`; after completion it briefly shows `✓ refreshed`.
-When costsee reloads automatically after Claude Code updates its usage data, it
-shows `✓ auto-refreshed`.
+When costsee reloads automatically it shows `✓ auto-refreshed`: Claude Code
+after it updates its usage data, and Codex once a minute while the dashboard
+is open. Set `refresh_interval_secs` in the configuration to change how often
+Codex is reread.
 
 ## Setup
 
@@ -164,5 +166,6 @@ not change the exit status from 0.
   database access is isolated, and costsee does not display estimates for
   unsupported data formats.
 - Usage values are the latest values reported by each CLI. Claude Code cache
-  updates are reflected automatically while costsee is running. For other
-  tools, communicate with the CLI once and then press `r` in costsee.
+  updates are reflected automatically while costsee is running, and Codex
+  usage is reread on `refresh_interval_secs` (default 60 seconds). For OpenCode,
+  communicate with the CLI once and then press `r` in costsee.

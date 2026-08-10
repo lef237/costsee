@@ -43,6 +43,13 @@ pub fn refresh_claude(config: &Config, snapshot: &mut QuotaSnapshot) {
     );
 }
 
+/// Collects Codex alone, folding any failure into its summary. The periodic
+/// auto-refresh runs this in the background so the dashboard keeps answering
+/// keys while the App Server starts.
+pub fn collect_codex(config: &Config) -> QuotaSummary {
+    codex_quota(&config.commands.codex).unwrap_or_else(error_summary)
+}
+
 fn error_summary(err: anyhow::Error) -> QuotaSummary {
     QuotaSummary {
         note: Some(format!("{err:#}")),
