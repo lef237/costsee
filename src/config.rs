@@ -10,6 +10,11 @@ pub struct Config {
     pub paths: Paths,
     /// How often the dashboard rereads Codex usage from the App Server.
     pub refresh_interval_secs: u64,
+    /// How often the dashboard asks Claude Code for account-wide usage,
+    /// covering the desktop app, IDE extensions, and other clients that never
+    /// run the status line. Matches the CLI's own internal cache lifetime, so
+    /// asking more often would not return fresher numbers.
+    pub claude_refresh_interval_secs: u64,
 }
 
 impl Default for Config {
@@ -19,6 +24,7 @@ impl Default for Config {
             commands: Commands::default(),
             paths: Paths::default(),
             refresh_interval_secs: 60,
+            claude_refresh_interval_secs: 300,
         }
     }
 }
@@ -53,12 +59,14 @@ impl Default for OpenCodeGoAllowances {
 #[serde(default)]
 pub struct Commands {
     pub codex: PathBuf,
+    pub claude: PathBuf,
 }
 
 impl Default for Commands {
     fn default() -> Self {
         Self {
             codex: PathBuf::from("codex"),
+            claude: PathBuf::from("claude"),
         }
     }
 }
@@ -68,6 +76,12 @@ impl Default for Commands {
 pub struct Paths {
     pub opencode_db: PathBuf,
     pub claude_usage_cache: PathBuf,
+    /// Claude Code's own `~/.claude.json`, read for the `cachedUsageUtilization`
+    /// snapshot it keeps regardless of which client last talked to the API.
+    pub claude_config_json: PathBuf,
+    /// The Claude desktop app's own usage history, the only source that
+    /// reflects that app's usage without asking `claude` to be installed.
+    pub claude_usage_history: PathBuf,
 }
 
 impl Default for Paths {
@@ -78,6 +92,10 @@ impl Default for Paths {
             claude_usage_cache: dirs::data_local_dir()
                 .unwrap_or_else(|| home.join(".local/share"))
                 .join("costsee/claude-usage.json"),
+            claude_config_json: home.join(".claude.json"),
+            claude_usage_history: dirs::config_dir()
+                .unwrap_or_else(|| home.join(".config"))
+                .join("Claude/plan-usage-history.json"),
         }
     }
 }
@@ -126,6 +144,13 @@ impl Config {
             .replacen(
                 "refresh_interval_secs = 60\n",
                 "# How often costsee rereads Codex usage from the App Server.\nrefresh_interval_secs = 60\n",
+                1,
+            )
+            .replacen(
+                "claude_refresh_interval_secs = 300\n",
+                "# How often costsee asks Claude Code for account-wide usage, covering\n\
+                 # clients besides this one (the desktop app, IDE extensions, etc).\n\
+                 claude_refresh_interval_secs = 300\n",
                 1,
             );
         fs::write(&path, raw)?;

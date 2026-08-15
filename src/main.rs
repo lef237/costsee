@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::Local;
 use clap::{Parser, Subcommand};
 use costsee::{
-    collect::{capture_claude, collect_quotas},
+    collect::{capture_claude, collect_quotas, probe_claude},
     config::Config,
     statusline,
 };
@@ -57,6 +57,12 @@ fn main() -> Result<()> {
 }
 
 fn report(config: &Config) -> Result<()> {
+    // A one-shot report has no dashboard loop to poll in the background, so
+    // ask Claude Code for account-wide usage here. Best-effort: a failure
+    // leaves whatever the cache already holds. The report also waits on the
+    // Codex App Server inside collect_quotas below, so this keeps the same
+    // "wait for the current numbers" contract rather than reading stale data.
+    let _ = probe_claude(config);
     let snapshot = collect_quotas(config);
     println!("tool\twindow\tused\treset\tstatus");
     for tool in costsee::model::Tool::ALL {

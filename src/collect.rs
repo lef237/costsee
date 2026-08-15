@@ -22,6 +22,9 @@ pub fn collect_quotas(config: &Config) -> QuotaSnapshot {
         Tool::Codex,
         codex_quota(&config.commands.codex).unwrap_or_else(error_summary),
     );
+    // Claude is read from its cache only, so this never blocks on `claude`.
+    // Account-wide probes run in the background: the dashboard polls on its
+    // own interval, and `report` asks for one explicitly before calling this.
     snapshot.tools.insert(
         Tool::Claude,
         claude_quota(&config.paths.claude_usage_cache).unwrap_or_else(error_summary),
@@ -191,6 +194,19 @@ fn codex_summary(response: &Value, updated_at: DateTime<Local>) -> Result<QuotaS
     })
 }
 
+/// The allowance windows Claude Code reports, in display order. The last two
+/// are populated only for plans with model-scoped weekly limits (currently
+/// Max), so most caches only ever fill the first two keys. The third element
+/// is the window's duration, used to expire readings that have no reset time:
+/// once older than the window itself, they can only describe a window that has
+/// already ended.
+const CLAUDE_WINDOWS: [(&str, &str, i64); 4] = [
+    ("five_hour", "5 hours", 5 * 60 * 60),
+    ("seven_day", "7 days", 7 * 24 * 60 * 60),
+    ("seven_day_opus", "7-day Opus", 7 * 24 * 60 * 60),
+    ("seven_day_sonnet", "7-day Sonnet", 7 * 24 * 60 * 60),
+];
+
 pub fn claude_quota(cache: &Path) -> Result<QuotaSummary> {
     if !cache.exists() {
         anyhow::bail!("run `costsee setup` to connect Claude Code");
@@ -199,16 +215,20 @@ pub fn claude_quota(cache: &Path) -> Result<QuotaSummary> {
     let value: Value = serde_json::from_str(&raw)?;
     let mut windows = Vec::new();
     let now = Local::now().timestamp();
-    for (key, label) in [("five_hour", "5 hours"), ("seven_day", "7 days")] {
-        let rate_limit = &value["rate_limits"][key];
-        let Some((percent, resets_at)) = valid_claude_window(rate_limit, now) else {
+    for (key, label, max_age) in CLAUDE_WINDOWS {
+        let Some(reading) = value["rate_limits"]
+            .get(key)
+            .and_then(|window| parse_claude_reading(window, now, max_age))
+        else {
             continue;
         };
         windows.push(LimitWindow {
             label: label.into(),
-            used_percent: percent,
-            resets_at: Local.timestamp_opt(resets_at, 0).single(),
-            detail: "reported by Claude Code".into(),
+            used_percent: reading.percent,
+            resets_at: reading
+                .resets_at
+                .and_then(|at| Local.timestamp_opt(at, 0).single()),
+            detail: reading.detail,
         });
     }
     if windows.is_empty() {
@@ -377,6 +397,360 @@ impl Drop for ChildGuard {
 
 pub fn capture_claude(input: &str, cache: &Path) -> Result<Vec<LimitWindow>> {
     let incoming: Value = serde_json::from_str(input).context("invalid Claude status-line JSON")?;
+    let now = Local::now().timestamp();
+    let normalized = normalize_claude_source(&incoming, "reported by Claude Code", now);
+    // The capture itself succeeded even if the merge or the reread below found
+    // nothing new. Claude Code runs this as its status line, so having nothing
+    // to report yet must not fail the command.
+    merge_and_write_claude_cache(cache, &[&normalized], now)?;
+    Ok(claude_quota(cache)
+        .map(|summary| summary.windows)
+        .unwrap_or_default())
+}
+
+/// Refreshes Claude Code's cache from every source that does not require a
+/// live status-line session: the account-wide `get_usage` control request,
+/// the CLI's own cached snapshot in `~/.claude.json`, and the desktop app's
+/// usage history, from most to least trusted. Each is independent and
+/// best-effort, so a source that is unavailable (no `claude` on PATH, no
+/// desktop app installed, offline) is skipped rather than failing the whole
+/// refresh; the merge below then keeps whichever surviving reading is
+/// freshest. Silent on total failure — the next periodic call tries again,
+/// and the status line keeps updating the same cache independently.
+pub fn probe_claude(config: &Config) -> Result<()> {
+    let now = Local::now().timestamp();
+    let mut readings = Vec::new();
+    if let Ok(rate_limits) = claude_usage_response(&config.commands.claude) {
+        readings.push(normalize_probe_response(&rate_limits, now));
+    }
+    if let Ok(cached) = read_claude_cached_utilization(&config.paths.claude_config_json) {
+        readings.push(normalize_cached_json(&cached, now));
+    }
+    if let Ok(sample) = read_claude_history_latest(&config.paths.claude_usage_history) {
+        readings.push(normalize_history_sample(&sample, now));
+    }
+    let candidates: Vec<&Value> = readings.iter().collect();
+    merge_and_write_claude_cache(&config.paths.claude_usage_cache, &candidates, now)
+}
+
+/// Sends Claude Code's own `get_usage` control request over a throwaway `-p`
+/// session and returns the `rate_limits` object from its reply. This is the
+/// same account-wide allowance data the desktop app and IDE extensions show;
+/// unlike the status line, it does not depend on a message having been sent
+/// from this particular client. Hooks are disabled so a background poll
+/// cannot trigger the user's own SessionStart/Stop automations, and session
+/// persistence is off so a five-minute poll never writes a session to disk.
+fn claude_usage_response(executable: &Path) -> Result<Value> {
+    let mut child = ChildGuard(
+        Command::new(executable)
+            .args([
+                "-p",
+                "--no-session-persistence",
+                "--verbose",
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+                "--settings",
+                r#"{"disableAllHooks":true}"#,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("failed to start {}", executable.display()))?,
+    );
+    let stdout = child
+        .0
+        .stdout
+        .take()
+        .context("Claude Code stdout is unavailable")?;
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                let _ = sender.send(value);
+            }
+        }
+    });
+    {
+        let mut stdin = child
+            .0
+            .stdin
+            .take()
+            .context("Claude Code stdin is unavailable")?;
+        let request = serde_json::json!({
+            "type": "control_request",
+            "request_id": "usage",
+            "request": {"subtype": "get_usage"}
+        });
+        send_json_line(&mut stdin, &request)?;
+        // Dropping stdin closes it, so Claude Code exits once it has replied
+        // instead of waiting for a turn that will never come.
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let message = receiver
+            .recv_timeout(remaining)
+            .context("timed out waiting for Claude Code usage")?;
+        if message["type"] != "control_response" || message["response"]["request_id"] != "usage" {
+            continue;
+        }
+        if message["response"]["subtype"] != "success" {
+            anyhow::bail!("Claude Code get_usage failed: {}", message["response"]);
+        }
+        return message["response"]["response"]
+            .get("rate_limits")
+            .filter(|value| value.is_object())
+            .cloned()
+            .context("Claude Code reported no rate limits");
+    }
+}
+
+fn normalize_probe_response(rate_limits: &Value, now: i64) -> Value {
+    let mut limits = Map::new();
+    for (key, _, _) in CLAUDE_WINDOWS {
+        let window = &rate_limits[key];
+        let Some(percent) = window["utilization"].as_f64() else {
+            continue;
+        };
+        let resets_at = window["resets_at"].as_str().and_then(parse_rfc3339_seconds);
+        limits.insert(
+            key.into(),
+            claude_window_json(percent, resets_at, "Claude Code · all clients", now),
+        );
+    }
+    serde_json::json!({ "rate_limits": limits })
+}
+
+fn read_claude_cached_utilization(path: &Path) -> Result<Value> {
+    let raw = std::fs::read_to_string(path)?;
+    let value: Value = serde_json::from_str(&raw)?;
+    value
+        .get("cachedUsageUtilization")
+        .cloned()
+        .context("no cachedUsageUtilization in Claude Code's own config")
+}
+
+fn normalize_cached_json(cached: &Value, now: i64) -> Value {
+    let fetched_at = cached["fetchedAtMs"].as_i64().map(|ms| ms / 1_000);
+    let detail = match fetched_at.and_then(|at| Local.timestamp_opt(at, 0).single()) {
+        Some(at) => format!("Claude Code cache · fetched {}", at.format("%m/%d %H:%M")),
+        None => "Claude Code cache".to_string(),
+    };
+    let utilization = &cached["utilization"];
+    let mut limits = Map::new();
+    for (key, _, _) in CLAUDE_WINDOWS {
+        let window = &utilization[key];
+        let Some(percent) = window["utilization"].as_f64() else {
+            continue;
+        };
+        let resets_at = window["resets_at"].as_str().and_then(parse_rfc3339_seconds);
+        limits.insert(
+            key.into(),
+            claude_window_json(percent, resets_at, &detail, fetched_at.unwrap_or(now)),
+        );
+    }
+    serde_json::json!({ "rate_limits": limits })
+}
+
+fn read_claude_history_latest(path: &Path) -> Result<Value> {
+    let raw = std::fs::read_to_string(path)?;
+    let value: Value = serde_json::from_str(&raw)?;
+    let samples = value["samples"]
+        .as_array()
+        .context("no samples in Claude desktop app history")?;
+    samples
+        .iter()
+        .max_by_key(|sample| sample["t"].as_i64().unwrap_or(0))
+        .cloned()
+        .context("Claude desktop app history is empty")
+}
+
+/// The desktop app records samples without a reset time, so these windows
+/// display as `reset unknown`; the detail string carries when the sample was
+/// taken instead, since the app may not have run recently.
+fn normalize_history_sample(sample: &Value, now: i64) -> Value {
+    let observed_at = sample["t"].as_i64().map(|ms| ms / 1_000).unwrap_or(now);
+    let detail = match Local.timestamp_opt(observed_at, 0).single() {
+        Some(at) => format!("Claude desktop app · seen {}", at.format("%m/%d %H:%M")),
+        None => "Claude desktop app".to_string(),
+    };
+    let usage = &sample["u"];
+    let mut limits = Map::new();
+    for (short, key) in [
+        ("fh", "five_hour"),
+        ("sd", "seven_day"),
+        ("so", "seven_day_opus"),
+        ("sn", "seven_day_sonnet"),
+    ] {
+        let Some(percent) = usage[short].as_f64() else {
+            continue;
+        };
+        limits.insert(
+            key.into(),
+            claude_window_json(percent, None, &detail, observed_at),
+        );
+    }
+    serde_json::json!({ "rate_limits": limits })
+}
+
+fn parse_rfc3339_seconds(text: &str) -> Option<i64> {
+    DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|at| at.timestamp())
+}
+
+/// Normalizes Claude Code's own status-line JSON into the same shape the
+/// other sources produce, so all four can be merged by one function.
+fn normalize_claude_source(raw: &Value, detail: &str, observed_at: i64) -> Value {
+    let mut limits = Map::new();
+    if let Some(source) = raw.get("rate_limits").and_then(Value::as_object) {
+        for (key, _, _) in CLAUDE_WINDOWS {
+            let Some(window) = source.get(key) else {
+                continue;
+            };
+            let Some(percent) = window["used_percentage"].as_f64() else {
+                continue;
+            };
+            let resets_at = window.get("resets_at").and_then(Value::as_i64);
+            limits.insert(
+                key.into(),
+                claude_window_json(percent, resets_at, detail, observed_at),
+            );
+        }
+    }
+    serde_json::json!({ "rate_limits": limits })
+}
+
+fn claude_window_json(
+    percent: f64,
+    resets_at: Option<i64>,
+    detail: &str,
+    observed_at: i64,
+) -> Value {
+    let mut window = serde_json::json!({
+        "used_percentage": percent,
+        "resets_at": resets_at,
+        "detail": detail,
+    });
+    // The observation time only breaks a tie between two undated readings; a
+    // dated one is always decided by its reset time instead. Persisting it
+    // anyway would change the cache on every poll even when usage has not
+    // moved, rewriting the file and flashing a false "auto-refreshed". So it
+    // is kept only where it can matter.
+    if resets_at.is_none() {
+        window["observed_at"] = observed_at.into();
+    }
+    window
+}
+
+struct ClaudeReading {
+    percent: f64,
+    resets_at: Option<i64>,
+    observed_at: i64,
+    detail: String,
+}
+
+fn parse_claude_reading(value: &Value, now: i64, max_age: i64) -> Option<ClaudeReading> {
+    let percent = value["used_percentage"].as_f64()?;
+    if !(percent.is_finite() && (0.0..=100.0).contains(&percent)) {
+        return None;
+    }
+    let resets_at = match value.get("resets_at") {
+        None | Some(Value::Null) => None,
+        Some(raw) => {
+            let at = raw.as_i64()?;
+            if at <= now {
+                // An expired dated window is not a usable reading at all,
+                // even as a last resort: it is not evidence of anything
+                // about the window that replaced it.
+                return None;
+            }
+            Some(at)
+        }
+    };
+    let observed_at = value["observed_at"].as_i64().unwrap_or(now);
+    // A reading without a reset time has nothing else to tie it to a window,
+    // so once it is older than the window itself it can only describe a window
+    // that has already ended; drop it rather than showing a stale number as
+    // the current one.
+    if resets_at.is_none() && observed_at < now.saturating_sub(max_age) {
+        return None;
+    }
+    let detail = value["detail"]
+        .as_str()
+        .unwrap_or("reported by Claude Code")
+        .to_string();
+    Some(ClaudeReading {
+        percent,
+        resets_at,
+        observed_at,
+        detail,
+    })
+}
+
+/// Picks the more trustworthy of two readings for the same window. A reading
+/// with a known reset time always beats one without, since usage is only
+/// guaranteed to move in one direction within a single, identifiable window.
+/// Between two dated readings, the one with the later reset wins outright
+/// (it belongs to a newer window); within the same reset, the higher usage
+/// wins, since usage cannot decrease before a reset. Between two undated
+/// readings, only the observation time can tell them apart.
+fn better_claude_reading(
+    old: Option<ClaudeReading>,
+    new: Option<ClaudeReading>,
+) -> Option<ClaudeReading> {
+    match (old, new) {
+        (Some(old), Some(new)) => Some(match (old.resets_at, new.resets_at) {
+            (Some(o), Some(n)) if n > o || (n == o && new.percent >= old.percent) => new,
+            (Some(_), Some(_)) => old,
+            (None, Some(_)) => new,
+            (Some(_), None) => old,
+            (None, None) if new.observed_at >= old.observed_at => new,
+            (None, None) => old,
+        }),
+        (Some(old), None) => Some(old),
+        (None, Some(new)) => Some(new),
+        (None, None) => None,
+    }
+}
+
+fn merge_claude_windows(
+    existing: Option<&Value>,
+    candidates: &[&Value],
+    now: i64,
+) -> Option<Map<String, Value>> {
+    let mut merged = Map::new();
+    for (key, _, max_age) in CLAUDE_WINDOWS {
+        let mut best = existing
+            .and_then(|value| value.get("rate_limits"))
+            .and_then(|limits| limits.get(key))
+            .and_then(|window| parse_claude_reading(window, now, max_age));
+        for candidate in candidates {
+            let reading = candidate
+                .get("rate_limits")
+                .and_then(|limits| limits.get(key))
+                .and_then(|window| parse_claude_reading(window, now, max_age));
+            best = better_claude_reading(best, reading);
+        }
+        if let Some(reading) = best {
+            merged.insert(
+                key.into(),
+                claude_window_json(
+                    reading.percent,
+                    reading.resets_at,
+                    &reading.detail,
+                    reading.observed_at,
+                ),
+            );
+        }
+    }
+    (!merged.is_empty()).then_some(merged)
+}
+
+fn merge_and_write_claude_cache(cache: &Path, candidates: &[&Value], now: i64) -> Result<()> {
     if let Some(parent) = cache.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -393,8 +767,7 @@ pub fn capture_claude(input: &str, cache: &Path) -> Result<Vec<LimitWindow>> {
     let existing = std::fs::read_to_string(cache)
         .ok()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
-    let now = Local::now().timestamp();
-    let rate_limits = merge_claude_limits(existing.as_ref(), &incoming, now).unwrap_or_default();
+    let rate_limits = merge_claude_windows(existing.as_ref(), candidates, now).unwrap_or_default();
     let sanitized = serde_json::json!({ "rate_limits": rate_limits });
 
     // Persist only the allowance fields. This also strips session metadata from
@@ -404,52 +777,7 @@ pub fn capture_claude(input: &str, cache: &Path) -> Result<Vec<LimitWindow>> {
     }
 
     lock.unlock()?;
-    // The capture itself succeeded. Claude Code runs this as its status line, so
-    // having nothing to report yet must not fail the command.
-    Ok(claude_quota(cache)
-        .map(|summary| summary.windows)
-        .unwrap_or_default())
-}
-
-fn valid_claude_window(value: &Value, now: i64) -> Option<(f64, i64)> {
-    let percent = value["used_percentage"].as_f64()?;
-    let resets_at = value["resets_at"].as_i64()?;
-    (percent.is_finite() && (0.0..=100.0).contains(&percent) && resets_at > now)
-        .then_some((percent, resets_at))
-}
-
-fn merge_claude_limits(
-    existing: Option<&Value>,
-    incoming: &Value,
-    now: i64,
-) -> Option<Map<String, Value>> {
-    let mut merged = Map::new();
-    for key in ["five_hour", "seven_day"] {
-        let old = existing
-            .and_then(|value| value.get("rate_limits"))
-            .and_then(|limits| limits.get(key));
-        let new = incoming
-            .get("rate_limits")
-            .and_then(|limits| limits.get(key));
-        let selected = match (
-            old.and_then(|value| valid_claude_window(value, now)),
-            new.and_then(|value| valid_claude_window(value, now)),
-        ) {
-            (Some((old_percent, old_reset)), Some((new_percent, new_reset)))
-                if new_reset > old_reset
-                    || (new_reset == old_reset && new_percent >= old_percent) =>
-            {
-                new
-            }
-            (Some(_), _) => old,
-            (None, Some(_)) => new,
-            (None, None) => None,
-        };
-        if let Some(value) = selected {
-            merged.insert(key.into(), value.clone());
-        }
-    }
-    (!merged.is_empty()).then_some(merged)
+    Ok(())
 }
 
 fn write_json_atomically(cache: &Path, value: &Value) -> Result<()> {
@@ -692,6 +1020,387 @@ mod tests {
         });
         std::fs::write(&cache, expired.to_string()).unwrap();
         assert!(claude_quota(&cache).is_err());
+    }
+
+    fn claude_reading(percent: f64, resets_at: Option<i64>, observed_at: i64) -> ClaudeReading {
+        ClaudeReading {
+            percent,
+            resets_at,
+            observed_at,
+            detail: "test".into(),
+        }
+    }
+
+    #[test]
+    fn parse_claude_reading_accepts_dated_and_undated_windows() {
+        let now = Local::now().timestamp();
+        let five_hour = 5 * 3_600;
+
+        let dated = serde_json::json!({"used_percentage": 40.0, "resets_at": now + 3_600});
+        let reading = parse_claude_reading(&dated, now, five_hour).unwrap();
+        assert_eq!(reading.resets_at, Some(now + 3_600));
+        assert_eq!(reading.detail, "reported by Claude Code");
+
+        let undated = serde_json::json!({"used_percentage": 12.0, "resets_at": null});
+        assert_eq!(
+            parse_claude_reading(&undated, now, five_hour)
+                .unwrap()
+                .resets_at,
+            None
+        );
+
+        let expired = serde_json::json!({"used_percentage": 90.0, "resets_at": now - 1});
+        assert!(parse_claude_reading(&expired, now, five_hour).is_none());
+
+        let out_of_range = serde_json::json!({"used_percentage": 140.0, "resets_at": null});
+        assert!(parse_claude_reading(&out_of_range, now, five_hour).is_none());
+
+        // Without a reset time, a reading older than the window can only be
+        // about a window that has already ended, so it is expired too.
+        let stale = serde_json::json!({
+            "used_percentage": 12.0,
+            "resets_at": null,
+            "observed_at": now - 6 * 3_600
+        });
+        assert!(parse_claude_reading(&stale, now, five_hour).is_none());
+        let fresh = serde_json::json!({
+            "used_percentage": 12.0,
+            "resets_at": null,
+            "observed_at": now - 2 * 3_600
+        });
+        assert!(parse_claude_reading(&fresh, now, five_hour).is_some());
+    }
+
+    #[test]
+    fn better_claude_reading_prefers_a_dated_reading_over_an_undated_one_either_way_round() {
+        let picked = better_claude_reading(
+            Some(claude_reading(90.0, None, 500)),
+            Some(claude_reading(5.0, Some(1_000), 0)),
+        );
+        assert_eq!(picked.unwrap().resets_at, Some(1_000));
+
+        let picked = better_claude_reading(
+            Some(claude_reading(5.0, Some(1_000), 0)),
+            Some(claude_reading(90.0, None, 500)),
+        );
+        assert_eq!(picked.unwrap().resets_at, Some(1_000));
+    }
+
+    #[test]
+    fn better_claude_reading_picks_the_later_reset_and_the_higher_usage_within_one() {
+        let picked = better_claude_reading(
+            Some(claude_reading(80.0, Some(1_000), 0)),
+            Some(claude_reading(4.0, Some(2_000), 0)),
+        );
+        assert_eq!(picked.unwrap().resets_at, Some(2_000));
+
+        let picked = better_claude_reading(
+            Some(claude_reading(10.0, Some(1_000), 0)),
+            Some(claude_reading(50.0, Some(1_000), 0)),
+        );
+        assert_eq!(picked.unwrap().percent, 50.0);
+    }
+
+    #[test]
+    fn better_claude_reading_breaks_undated_ties_by_observation_time() {
+        let picked = better_claude_reading(
+            Some(claude_reading(90.0, None, 100)),
+            Some(claude_reading(3.0, None, 200)),
+        );
+        assert_eq!(picked.unwrap().percent, 3.0);
+    }
+
+    #[test]
+    fn normalize_probe_response_reads_utilization_and_rfc3339_resets() {
+        let now = Local::now().timestamp();
+        let resets_at = Local::now() + chrono::Duration::hours(1);
+        let rate_limits = serde_json::json!({
+            "five_hour": {"utilization": 46, "resets_at": resets_at.to_rfc3339()},
+            "seven_day": {"utilization": 43, "resets_at": resets_at.to_rfc3339()},
+            "seven_day_opus": null
+        });
+
+        let normalized = normalize_probe_response(&rate_limits, now);
+
+        let reading =
+            parse_claude_reading(&normalized["rate_limits"]["five_hour"], now, 5 * 3_600).unwrap();
+        assert_eq!(reading.percent, 46.0);
+        assert!(reading.resets_at.is_some());
+        assert_eq!(reading.detail, "Claude Code · all clients");
+        assert!(normalized["rate_limits"].get("seven_day_opus").is_none());
+        assert!(normalized["rate_limits"].get("seven_day_sonnet").is_none());
+    }
+
+    #[test]
+    fn normalize_cached_json_reads_the_clis_own_cache_shape() {
+        let now = Local::now().timestamp();
+        let resets_at = Local::now() + chrono::Duration::hours(2);
+        let cached = serde_json::json!({
+            "fetchedAtMs": now * 1_000,
+            "utilization": {
+                "five_hour": null,
+                "seven_day": {"utilization": 43, "resets_at": resets_at.to_rfc3339()}
+            }
+        });
+
+        let normalized = normalize_cached_json(&cached, now);
+
+        let reading =
+            parse_claude_reading(&normalized["rate_limits"]["seven_day"], now, 7 * 24 * 3_600)
+                .unwrap();
+        assert_eq!(reading.percent, 43.0);
+        assert!(reading.detail.starts_with("Claude Code cache · fetched"));
+        assert!(normalized["rate_limits"].get("five_hour").is_none());
+    }
+
+    #[test]
+    fn a_cli_cache_without_a_reset_time_is_aged_by_its_fetch_time() {
+        // The cache snapshot is dated by fetchedAtMs, not by the poll time, so
+        // a two-day-old snapshot without a reset time is expired rather than
+        // being treated as the freshest reading.
+        let now = Local::now().timestamp();
+        let cached = serde_json::json!({
+            "fetchedAtMs": (now - 48 * 3_600) * 1_000,
+            "utilization": {
+                "five_hour": {"utilization": 80, "resets_at": null}
+            }
+        });
+
+        let normalized = normalize_cached_json(&cached, now);
+        let reading = parse_claude_reading(&normalized["rate_limits"]["five_hour"], now, 5 * 3_600);
+
+        assert!(reading.is_none());
+    }
+
+    #[test]
+    fn normalize_history_sample_maps_short_keys_and_has_no_reset_time() {
+        let observed = Local::now().timestamp();
+        let sample = serde_json::json!({"t": observed * 1_000, "u": {"fh": 12, "sd": 55}});
+
+        let normalized = normalize_history_sample(&sample, observed);
+
+        let reading =
+            parse_claude_reading(&normalized["rate_limits"]["five_hour"], observed, 5 * 3_600)
+                .unwrap();
+        assert_eq!(reading.percent, 12.0);
+        assert_eq!(reading.resets_at, None);
+        assert!(reading.detail.starts_with("Claude desktop app · seen"));
+        assert!(normalized["rate_limits"].get("seven_day_opus").is_none());
+    }
+
+    #[test]
+    fn read_claude_history_latest_picks_the_newest_sample_regardless_of_order() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("plan-usage-history.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "version": 2,
+                "samples": [
+                    {"t": 1_000, "u": {"fh": 10, "sd": 20}},
+                    {"t": 3_000, "u": {"fh": 30, "sd": 40}},
+                    {"t": 2_000, "u": {"fh": 15, "sd": 25}}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let latest = read_claude_history_latest(&path).unwrap();
+
+        assert_eq!(latest["t"], 3_000);
+    }
+
+    #[test]
+    fn probe_claude_falls_back_to_the_cli_cache_and_desktop_history_when_the_probe_is_unavailable()
+    {
+        let directory = tempdir().unwrap();
+        let mut config = Config::default();
+        config.commands.claude = "/nonexistent/claude".into();
+        config.paths.claude_usage_cache = directory.path().join("claude-usage.json");
+        config.paths.claude_config_json = directory.path().join("claude.json");
+        config.paths.claude_usage_history = directory.path().join("plan-usage-history.json");
+
+        // Only the CLI's cache knows the seven-day window's reset time, so it
+        // must win there even though the desktop app reports higher usage.
+        // Only the desktop app reports the five-hour window at all.
+        let resets_at = Local::now() + chrono::Duration::hours(3);
+        std::fs::write(
+            &config.paths.claude_config_json,
+            serde_json::json!({
+                "cachedUsageUtilization": {
+                    "fetchedAtMs": Local::now().timestamp() * 1_000,
+                    "utilization": {
+                        "seven_day": {"utilization": 46, "resets_at": resets_at.to_rfc3339()}
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            &config.paths.claude_usage_history,
+            serde_json::json!({
+                "version": 2,
+                "samples": [
+                    {"t": Local::now().timestamp() * 1_000, "u": {"fh": 22, "sd": 90}}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        probe_claude(&config).unwrap();
+
+        let summary = claude_quota(&config.paths.claude_usage_cache).unwrap();
+        let five_hour = summary
+            .windows
+            .iter()
+            .find(|window| window.label == "5 hours")
+            .unwrap();
+        let seven_day = summary
+            .windows
+            .iter()
+            .find(|window| window.label == "7 days")
+            .unwrap();
+        assert_eq!(five_hour.used_percent, 22.0);
+        assert!(five_hour.resets_at.is_none());
+        assert_eq!(seven_day.used_percent, 46.0);
+        assert!(seven_day.resets_at.is_some());
+    }
+
+    #[test]
+    fn a_reading_keeps_its_observation_time_only_when_it_has_no_reset_time() {
+        let now = Local::now().timestamp();
+
+        let dated = claude_window_json(40.0, Some(now + 3_600), "probe", now);
+        assert!(dated.get("observed_at").is_none());
+
+        let undated = claude_window_json(12.0, None, "desktop", now);
+        assert_eq!(undated["observed_at"], now);
+    }
+
+    #[test]
+    fn probing_with_unchanged_usage_never_rewrites_the_cache() {
+        let directory = tempdir().unwrap();
+        let cache = directory.path().join("claude-usage.json");
+        let resets_at = Local::now() + chrono::Duration::hours(1);
+        let rate_limits = serde_json::json!({
+            "five_hour": {"utilization": 46, "resets_at": resets_at.to_rfc3339()}
+        });
+        let normalized = normalize_probe_response(&rate_limits, Local::now().timestamp());
+
+        merge_and_write_claude_cache(&cache, &[&normalized], Local::now().timestamp()).unwrap();
+        let before = std::fs::metadata(&cache).unwrap().modified().unwrap();
+        // A later poll within the same window agrees with the first, so the
+        // cache must not be touched and the dashboard must show no refresh.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        merge_and_write_claude_cache(&cache, &[&normalized], Local::now().timestamp()).unwrap();
+        let after = std::fs::metadata(&cache).unwrap().modified().unwrap();
+
+        assert_eq!(before, after);
+    }
+
+    /// Writes a stand-in for `claude -p --verbose ...` that swallows the
+    /// control request on stdin and answers with `reply_lines` on stdout, the
+    /// way the real binary did when this shape was verified against it.
+    #[cfg(unix)]
+    fn mock_claude(reply_lines: &[&str]) -> (tempfile::TempDir, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempdir().unwrap();
+        let executable = directory.path().join("claude");
+        let script = format!(
+            "#!/bin/sh\ncat > /dev/null\ncat <<'EOF'\n{}\nEOF\n",
+            reply_lines.join("\n")
+        );
+        std::fs::write(&executable, script).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (directory, executable)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_usage_response_parses_a_real_control_reply() {
+        let resets_at = Local::now() + chrono::Duration::hours(1);
+        // The foreign request id proves the probe skips messages that are not
+        // its reply before matching, as the real binary also interleaves other
+        // messages with the control response.
+        let foreign = serde_json::json!({
+            "type": "assistant",
+            "request_id": "other",
+            "message": {"role": "assistant", "content": []},
+        })
+        .to_string();
+        let reply = serde_json::json!({
+            "type": "control_response",
+            "response": {
+                "request_id": "usage",
+                "subtype": "success",
+                "response": {
+                    "rate_limits": {
+                        "five_hour": {"utilization": 46, "resets_at": resets_at.to_rfc3339()},
+                        "seven_day": {"utilization": 43, "resets_at": null},
+                        "seven_day_opus": null,
+                    }
+                }
+            }
+        })
+        .to_string();
+        let (directory, executable) = mock_claude(&[&foreign, &reply]);
+
+        let rate_limits = claude_usage_response(&executable).unwrap();
+        drop(directory);
+
+        // The raw reply carries the account-wide shape; feed it through the
+        // same normalization the probe path uses before reading percentages.
+        let now = Local::now().timestamp();
+        let normalized = normalize_probe_response(&rate_limits, now);
+        let five_hour =
+            parse_claude_reading(&normalized["rate_limits"]["five_hour"], now, 5 * 3_600).unwrap();
+        assert_eq!(five_hour.percent, 46.0);
+        assert_eq!(five_hour.resets_at, Some(resets_at.timestamp()));
+        let seven_day =
+            parse_claude_reading(&normalized["rate_limits"]["seven_day"], now, 7 * 24 * 3_600)
+                .unwrap();
+        assert_eq!(seven_day.percent, 43.0);
+        assert!(seven_day.resets_at.is_none());
+        assert!(normalized["rate_limits"].get("seven_day_opus").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_usage_response_rejects_a_failed_control_reply() {
+        let reply = serde_json::json!({
+            "type": "control_response",
+            "response": {
+                "request_id": "usage",
+                "subtype": "failure",
+                "response": {"error": "not subscribed"},
+            }
+        })
+        .to_string();
+        let (directory, executable) = mock_claude(&[&reply]);
+
+        let result = claude_usage_response(&executable);
+        drop(directory);
+
+        assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_usage_response_requires_rate_limits_in_a_successful_reply() {
+        let reply = serde_json::json!({
+            "type": "control_response",
+            "response": {"request_id": "usage", "subtype": "success", "response": {}}
+        })
+        .to_string();
+        let (directory, executable) = mock_claude(&[&reply]);
+
+        let result = claude_usage_response(&executable);
+        drop(directory);
+
+        assert!(result.is_err());
     }
 
     #[test]

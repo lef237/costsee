@@ -26,8 +26,10 @@ between blocks. Borders turn yellow above 70% usage and red above 90%.
 
 - Codex: usage percentages for five-hour, seven-day, and other windows reported
   by the official App Server
-- Claude Code: five-hour and seven-day usage percentages reported by the
-  official status line
+- Claude Code: five-hour and seven-day usage percentages (plus the model-scoped
+  weekly windows on plans that have them), covering usage from every client on
+  the account — the CLI, the desktop app, IDE extensions — not just the
+  terminal costsee runs in
 - OpenCode: recorded local cost divided by configured spending limits
 
 OpenCode supports multiple providers and does not have a single shared
@@ -55,22 +57,24 @@ costsee
 Press `r` to refresh and `q` or `Esc` to quit. While a refresh is running, the
 footer shows `refreshing…`; after completion it briefly shows `✓ refreshed`.
 When costsee reloads automatically it shows `✓ auto-refreshed`: Claude Code
-after it updates its usage data, and Codex once a minute while the dashboard
-is open. Set `refresh_interval_secs` in the configuration to change how often
-Codex is reread.
+whenever any of its usage sources updates, and Codex once a minute while the
+dashboard is open. Set `refresh_interval_secs` and `claude_refresh_interval_secs`
+in the configuration to change how often Codex and Claude Code are reread.
 
 ## Setup
 
-Codex is detected without additional configuration. Connect Claude Code's
-official status-line usage feed with:
+Codex is detected without additional configuration. Claude Code usage is also
+read without configuration, as long as `claude` is on `PATH` — see
+[Claude Code usage sources](#claude-code-usage-sources) below. Connect Claude
+Code's official status line, which also draws the allowance bars below your
+prompt, with:
 
 ```console
 costsee setup
 ```
 
 This adds a `statusLine` entry to `~/.claude/settings.json` only when one is not
-already configured. It never overwrites an existing status line. After setup,
-send one message in Claude Code to save the latest usage data.
+already configured. It never overwrites an existing status line.
 
 If you are upgrading from an earlier version, run `costsee setup` again. This
 disables periodic updates from old, idle Claude Code sessions.
@@ -98,6 +102,33 @@ so a fresh session starts with the model name alone and fills in as it runs.
 Until the first API response returns allowance data, the second row reads
 `allowance pending`. Set `NO_COLOR` to render the status line without colors.
 
+## Claude Code usage sources
+
+Besides the status line, costsee reads Claude Code's account-wide usage from
+up to three more sources, from most to least trusted:
+
+1. Claude Code's own `get_usage` control request, sent over a short-lived,
+   hook-disabled, persistence-free `claude -p` session that never writes a
+   session to disk. This is the same account-wide allowance
+   data the desktop app and IDE extensions show, so it reflects usage from
+   every client on the account, not just costsee's own terminal.
+2. The CLI's own cached snapshot in `~/.claude.json`, which Claude Code
+   refreshes periodically on its own regardless of which client last used it.
+3. The Claude desktop app's local usage history, read only when it is
+   installed. It does not record reset times, so windows sourced from it show
+   `reset unknown`; the block's detail text shows when that sample was taken
+   instead.
+
+Each source is independent and optional; costsee uses whichever it can reach.
+Whichever produced the most recent still-valid reading for a window wins — a
+reading with a known reset time always outranks one without, since only it can
+be trusted to represent the current window. costsee polls these sources every
+`claude_refresh_interval_secs` (default 300 seconds, matching how long Claude
+Code's own cache stays fresh) while the dashboard is open, and once more on
+every manual refresh. Set `commands.claude` if `claude` is not on `PATH`, or
+`paths.claude_config_json` / `paths.claude_usage_history` if either file lives
+somewhere nonstandard.
+
 To configure time-window limits for OpenCode Go, run:
 
 ```console
@@ -121,12 +152,13 @@ the five-hour and weekly windows, so the UI displays `unknown`. The existing
 `allowances.opencode_monthly_usd` setting remains supported for monthly usage.
 
 The default configuration path is `~/.config/costsee/config.toml` on every
-operating system. Use `--config` to specify a different path. If `codex` is not
-on `PATH`, set its executable path under `[commands]`:
+operating system. Use `--config` to specify a different path. If `codex` or
+`claude` is not on `PATH`, set its executable path under `[commands]`:
 
 ```toml
 [commands]
 codex = "/path/to/codex"
+claude = "/path/to/claude"
 ```
 
 ## Non-interactive reports
@@ -152,20 +184,30 @@ not change the exit status from 0.
   logs or credentials.
 - For OpenCode, costsee reads only timestamps, providers, and costs from the
   local SQLite database in read-only mode. It does not read conversation text.
-- For Claude Code, costsee caches only usage percentages and reset times from
-  the official status-line input. The model, directory, context, and cost shown
-  in the status line are drawn straight from that input and never written to
-  disk, and the session ID and transcript path are neither displayed nor saved.
+- For Claude Code, costsee caches only usage percentages, reset times, and
+  which of the sources below reported them. From the official status-line
+  input, that also includes the model, directory, context, and cost shown in
+  the status line, which are drawn straight from that input and never written
+  to disk; the session ID and transcript path are neither displayed nor saved.
   The branch is read from the repository's own `HEAD` file, without running
-  `git` and without touching commits, remotes, or working-tree contents.
-- costsee does not collect API keys, call private APIs, or send telemetry. The
-  official Codex App Server uses Codex's existing authentication when costsee
-  requests rate-limit data.
+  `git` and without touching commits, remotes, or working-tree contents. The
+  account-wide `get_usage` request runs over a throwaway, hook-disabled `-p`
+  session that persists no history, exactly like the official desktop app and
+  IDE extensions already do; it never sends a prompt, so it never starts a
+  conversation or spends tokens. The `~/.claude.json` and desktop-app history reads are limited to
+  the same usage percentages, reset times, and sample timestamps; neither is
+  ever asked for conversation content, tokens, or credentials.
+- costsee does not collect API keys, call private HTTP APIs, or send
+  telemetry. Every request goes through the official `codex` or `claude`
+  binary using its own existing authentication; costsee never reads or
+  transmits credentials itself.
 - OpenCode does not provide an official API that supports accurate time-window
   aggregation without reading conversation text. For that reason, local
   database access is isolated, and costsee does not display estimates for
   unsupported data formats.
-- Usage values are the latest values reported by each CLI. Claude Code cache
-  updates are reflected automatically while costsee is running, and Codex
-  usage is reread on `refresh_interval_secs` (default 60 seconds). For OpenCode,
-  communicate with the CLI once and then press `r` in costsee.
+- Usage values are the latest values reported by each CLI. Claude Code's
+  status-line cache updates are reflected automatically while costsee is
+  running; its other sources are reread on `claude_refresh_interval_secs`
+  (default 300 seconds), and Codex usage is reread on `refresh_interval_secs`
+  (default 60 seconds). For OpenCode, communicate with the CLI once and then
+  press `r` in costsee.

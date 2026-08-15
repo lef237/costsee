@@ -1,5 +1,5 @@
 use crate::{
-    collect::{collect_codex, collect_quotas, refresh_claude},
+    collect::{collect_codex, collect_quotas, probe_claude, refresh_claude},
     config::Config,
     format::{CRITICAL_PERCENT, WARNING_PERCENT, bar_fill, remaining_reset_time},
     model::{LimitWindow, QuotaSnapshot, QuotaSummary, Tool},
@@ -22,7 +22,11 @@ use ratatui::{
 };
 use std::{
     io,
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -72,6 +76,17 @@ fn app_loop(
     let mut codex_in_flight = false;
     let mut last_codex_refresh = Instant::now();
     let codex_interval = Duration::from_secs(config.refresh_interval_secs.max(1));
+    // The probe can shell out to `claude` and read two more files, so like
+    // Codex it runs on its own worker thread on its own interval. Its result
+    // reaches the dashboard indirectly: it writes the same cache file the
+    // status line does, and the mtime check below already reloads on any
+    // change to that file, so no dedicated channel is needed here. Firing one
+    // now rather than waiting for the interval means account-wide usage lands
+    // shortly after launch without holding up startup.
+    let claude_probe_in_flight = Arc::new(AtomicBool::new(false));
+    let mut last_claude_probe = Instant::now();
+    let claude_probe_interval = Duration::from_secs(config.claude_refresh_interval_secs.max(1));
+    start_claude_probe(&config, &claude_probe_in_flight, &mut last_claude_probe);
     let mut status = Status::Idle;
     loop {
         terminal.draw(|frame| draw(frame, &snapshot, &config_path, status))?;
@@ -111,6 +126,9 @@ fn app_loop(
                     by_key: false,
                 };
             }
+            if last_claude_probe.elapsed() >= claude_probe_interval {
+                start_claude_probe(&config, &claude_probe_in_flight, &mut last_claude_probe);
+            }
             continue;
         }
         if let Event::Key(key) = event::read()? {
@@ -130,6 +148,10 @@ fn app_loop(
                     codex_in_flight = false;
                     codex_generation += 1;
                     last_codex_refresh = Instant::now();
+                    // Claude Code was just reread from its cache. A background
+                    // probe refreshes that cache without holding up the refresh;
+                    // the mtime check above folds its result in when it lands.
+                    start_claude_probe(&config, &claude_probe_in_flight, &mut last_claude_probe);
                     status = Status::Refreshed {
                         at: Instant::now(),
                         by_key: true,
@@ -177,6 +199,24 @@ fn cache_modified(path: &std::path::Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path)
         .ok()
         .and_then(|metadata| metadata.modified().ok())
+}
+
+/// Kicks off a background probe of Claude Code's account-wide usage sources,
+/// unless one is already running, so the dashboard never blocks on `claude`.
+/// The probe writes the shared cache file, which the mtime check above already
+/// reloads, so the dashboard needs no channel to hear about its result.
+fn start_claude_probe(config: &Config, in_flight: &Arc<AtomicBool>, last_started: &mut Instant) {
+    if in_flight.load(Ordering::Relaxed) {
+        return;
+    }
+    in_flight.store(true, Ordering::Relaxed);
+    *last_started = Instant::now();
+    let config = config.clone();
+    let in_flight = in_flight.clone();
+    thread::spawn(move || {
+        let _ = probe_claude(&config);
+        in_flight.store(false, Ordering::Relaxed);
+    });
 }
 
 const INDENT: usize = 2;
