@@ -79,7 +79,23 @@ already configured. It never overwrites an existing status line.
 If you are upgrading from an earlier version, run `costsee setup` again. This
 disables periodic updates from old, idle Claude Code sessions.
 
+For Codex CLI's status line, run:
+
+```console
+costsee setup codex
+```
+
+This installs a preset in `~/.codex/config.toml` (or `$CODEX_HOME/config.toml`)
+showing the model with reasoning effort, directory, Git branch, context used,
+and remaining primary and weekly allowances. Restart Codex CLI to apply it.
+Existing `tui.status_line` settings, including an empty list, are never
+overwritten. Comments and other settings are preserved. Use `/statusline`
+inside Codex to customize an existing configuration. `costsee setup claude`
+is equivalent to `costsee setup`.
+
 ## Status line
+
+### Claude Code
 
 While it records usage data, costsee also draws Claude Code's status line. The
 first row describes the session and the second the subscription allowances,
@@ -101,6 +117,25 @@ Every part of the first row is omitted while Claude Code has nothing to report,
 so a fresh session starts with the model name alone and fills in as it runs.
 Until the first API response returns allowance data, the second row reads
 `allowance pending`. Set `NO_COLOR` to render the status line without colors.
+
+### Codex CLI
+
+Codex supports an ordered list of built-in status items through
+[`tui.status_line`](https://developers.openai.com/codex/config-reference/),
+rather than Claude Code's external command renderer. `costsee setup codex`
+configures these native items:
+
+```toml
+[tui]
+status_line = ["model-with-reasoning", "current-dir", "git-branch", "context-used", "five-hour-limit", "weekly-limit"]
+```
+
+Codex renders and updates this footer itself; costsee does not need to keep
+running. The allowance items show **remaining** capacity, whereas costsee's
+dashboard and Claude Code bars show **used** capacity. Items without data are
+omitted by Codex. Custom bars, two-row layout, and costsee's colors are only
+available in Claude Code's status line; use the costsee dashboard to see Codex
+usage with those bars.
 
 ## Claude Code usage sources
 

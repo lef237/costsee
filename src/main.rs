@@ -1,6 +1,6 @@
 use anyhow::Result;
 use chrono::Local;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use costsee::{
     collect::{capture_claude, collect_quotas, probe_claude},
     config::Config,
@@ -26,13 +26,22 @@ struct Cli {
 enum Command {
     /// Create an editable default config.
     Init,
-    /// Connect Claude Code's official status-line usage feed.
-    Setup,
+    /// Configure a tool's status line (defaults to Claude Code).
+    Setup {
+        #[arg(value_enum, default_value_t = SetupTool::Claude)]
+        tool: SetupTool,
+    },
     /// Receive Claude Code status-line JSON (normally called by Claude Code).
     #[command(hide = true)]
     CaptureClaude,
     /// Print the current allowance percentages without opening the TUI.
     Report,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum SetupTool {
+    Claude,
+    Codex,
 }
 
 fn main() -> Result<()> {
@@ -44,16 +53,40 @@ fn main() -> Result<()> {
             println!("created {}", path.display());
             return Ok(());
         }
-        Some(Command::Setup) => return setup_claude(),
+        Some(Command::Setup { tool }) => {
+            return match tool {
+                SetupTool::Claude => setup_claude(),
+                SetupTool::Codex => setup_codex(),
+            };
+        }
         _ => {}
     }
     let (config, path) = Config::load(cli.config)?;
     match cli.command {
         Some(Command::CaptureClaude) => capture(&config),
         Some(Command::Report) => report(&config),
-        Some(Command::Init | Command::Setup) => unreachable!(),
+        Some(Command::Init | Command::Setup { .. }) => unreachable!(),
         None => costsee::ui::run(config, path),
     }
+}
+
+fn setup_codex() -> Result<()> {
+    let home = std::env::var_os("CODEX_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
+        .ok_or_else(|| anyhow::anyhow!("home directory is unavailable"))?;
+    let settings = home.join("config.toml");
+    if costsee::setup::configure_codex(&settings)? {
+        println!("Configured Codex status line via {}", settings.display());
+    } else {
+        println!("Codex status line is already configured.");
+    }
+    println!("Restart Codex CLI to apply. Use /statusline in Codex to customize it.");
+    println!(
+        "Codex uses its built-in display and shows remaining allowance, not costsee's usage bars."
+    );
+    Ok(())
 }
 
 fn report(config: &Config) -> Result<()> {
